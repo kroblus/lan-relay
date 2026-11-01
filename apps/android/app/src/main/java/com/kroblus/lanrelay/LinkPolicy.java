@@ -12,6 +12,12 @@ import java.util.Set;
 public final class LinkPolicy {
     private LinkPolicy() { }
 
+    public static final class OwnerLinkException extends IllegalArgumentException {
+        private OwnerLinkException() {
+            super("这是电脑管理入口。手机请扫描网页内的配对二维码。");
+        }
+    }
+
     public static final class Endpoint {
         public final String origin;
         public final String url;
@@ -37,6 +43,9 @@ public final class LinkPolicy {
         if (implicitScheme) value = "http://" + value;
         URI uri = parse(value);
         String scheme = lower(uri.getScheme());
+        // Recognize owner links before validating the LAN host: terminal links may use localhost.
+        // Sharing must reject these credentials instead of falling back to ordinary shared text.
+        if ("http".equals(scheme) || "https".equals(scheme)) rejectOwnerFragment(uri.getRawFragment());
         if (!("http".equals(scheme) || "https".equals(scheme)) || uri.getRawUserInfo() != null
                 || uri.getHost() == null || uri.getRawQuery() != null) {
             throw invalid("只接受电脑的 HTTP / HTTPS 局域网连接地址。");
@@ -86,7 +95,7 @@ public final class LinkPolicy {
             String key = decode(parts[0]);
             String value = decode(parts[1]);
             if (!seen.add(key)) throw invalid("配对链接含重复参数，请重新扫码。");
-            if ("owner".equalsIgnoreCase(key)) throw invalid("这是电脑管理入口。手机请扫描网页内的配对二维码。");
+            if ("owner".equalsIgnoreCase(key)) throw new OwnerLinkException();
             if ("pair".equals(key)) {
                 if (!value.matches("[A-Za-z0-9_-]{16,256}")) throw invalid("配对信息格式有误，请重新扫码。");
             } else if ("code".equals(key)) {
@@ -96,6 +105,16 @@ public final class LinkPolicy {
             normalized.append(key).append('=').append(value);
         }
         return normalized.toString();
+    }
+
+    private static void rejectOwnerFragment(String fragment) {
+        if (fragment == null) return;
+        for (String entry : fragment.split("&", -1)) {
+            String key;
+            try { key = decode(entry.split("=", 2)[0]); }
+            catch (IllegalArgumentException error) { continue; }
+            if ("owner".equalsIgnoreCase(key)) throw new OwnerLinkException();
+        }
     }
 
     public static boolean sameOrigin(String approvedOrigin, String url) {

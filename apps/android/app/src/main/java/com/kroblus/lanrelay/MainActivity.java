@@ -80,6 +80,7 @@ public final class MainActivity extends ComponentActivity {
     private ProgressBar loading;
     private WebView webView;
     private volatile String approvedOrigin;
+    private long connectionGeneration; // Main-thread epoch; reopening the same computer also invalidates pending work.
     private LinkPolicy.Endpoint pendingEndpoint;
     private ValueCallback<Uri[]> fileCallback;
     private String chooserOrigin;
@@ -290,6 +291,7 @@ public final class MainActivity extends ComponentActivity {
             }
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
                 if (!LinkPolicy.sameOrigin(approvedOrigin, url)) { view.stopLoading(); return; }
+                connectionGeneration++;
                 loading.setVisibility(View.VISIBLE);
                 errorPanel.setVisibility(View.GONE);
             }
@@ -374,6 +376,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private void openEndpoint(LinkPolicy.Endpoint endpoint) {
+        connectionGeneration++;
         completeFileChoice(null);
         approvedOrigin = endpoint.origin;
         preferences.edit().putString("origin", endpoint.origin).apply();
@@ -422,6 +425,10 @@ public final class MainActivity extends ComponentActivity {
                 if (endpoint.pairedLink || value.startsWith("lanrelay:")) {
                     connectInput(value); updateShareHint(); return true;
                 }
+            } catch (LinkPolicy.OwnerLinkException error) {
+                showError(error.getMessage());
+                updateShareHint();
+                return true;
             } catch (IllegalArgumentException ignored) { /* Ordinary shared text stays text, never a navigation. */ }
             sharedText = text.toString();
         }
@@ -495,8 +502,9 @@ public final class MainActivity extends ComponentActivity {
 
     private void startDownload(String url, String userAgent, String disposition, String mime, long length) {
         final String origin = approvedOrigin;
+        final long generation = connectionGeneration;
         if (!LinkPolicy.authenticatedDownload(origin, url)) { toast("这里只能下载当前电脑工作区里的文件。"); return; }
-        if (Build.VERSION.SDK_INT >= 37 && checkSelfPermission(LOCAL_NETWORK_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+        if (!hasLocalNetworkPermission()) {
             showError("局域网权限已关闭，请先允许连接，再重新下载。"); return;
         }
         final String cookie = CookieManager.getInstance().getCookie(url);
@@ -505,7 +513,15 @@ public final class MainActivity extends ComponentActivity {
             try {
                 DownloadPreflight.Metadata metadata = DownloadPreflight.inspect(origin, url, cookie, userAgent);
                 runOnUiThread(() -> {
-                    if (isDestroyed() || !Objects.equals(origin, approvedOrigin)) return;
+                    if (!isCurrentDownload(generation, origin)) return;
+                    if (!Objects.equals(cookie, CookieManager.getInstance().getCookie(url))) {
+                        toast("登录状态已改变，请重新点击文件下载。");
+                        return;
+                    }
+                    if (!hasLocalNetworkPermission()) {
+                        showError("局域网权限已关闭，请先允许连接，再重新下载。");
+                        return;
+                    }
                     try {
                         String filename = filename(url, metadata.disposition, metadata.mime);
                         DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
@@ -524,12 +540,27 @@ public final class MainActivity extends ComponentActivity {
             } catch (java.io.IOException error) {
                 String message = error.getMessage();
                 runOnUiThread(() -> {
-                    if (!isDestroyed()) showError(message != null && message.startsWith("电脑") || message != null && message.startsWith("连接")
+                    if (!isCurrentDownload(generation, origin)
+                            || !Objects.equals(cookie, CookieManager.getInstance().getCookie(url))) return;
+                    if (!hasLocalNetworkPermission()) {
+                        showError("局域网权限已关闭，请先允许连接，再重新下载。");
+                        return;
+                    }
+                    showError(message != null && message.startsWith("电脑") || message != null && message.startsWith("连接")
                             || message != null && message.startsWith("下载") || message != null && message.startsWith("只允许")
                             ? message : "无法向电脑确认文件，请检查连接后重试。");
                 });
             }
         });
+    }
+
+    private boolean isCurrentDownload(long generation, String origin) {
+        return !isDestroyed() && !isFinishing() && generation == connectionGeneration
+                && Objects.equals(origin, approvedOrigin);
+    }
+
+    private boolean hasLocalNetworkPermission() {
+        return Build.VERSION.SDK_INT < 37 || checkSelfPermission(LOCAL_NETWORK_PERMISSION) == PackageManager.PERMISSION_GRANTED;
     }
 
     private static String filename(String url, String disposition, String mime) {
@@ -580,6 +611,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private void showConnection() {
+        connectionGeneration++;
         connectionScreen.setVisibility(View.VISIBLE);
         webView.setVisibility(View.GONE);
         loading.setVisibility(View.GONE);
@@ -632,6 +664,7 @@ public final class MainActivity extends ComponentActivity {
         if (webView != null) webView.onResume();
     }
     @Override protected void onDestroy() {
+        connectionGeneration++;
         completeFileChoice(null);
         downloads.shutdownNow();
         webView.stopLoading();

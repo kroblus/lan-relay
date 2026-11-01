@@ -44,6 +44,22 @@ public class LinkPolicyTest {
         rejects("http://10.0.0.1:4318/#x=1");
     }
 
+    @Test public void sharedOwnerLinksHaveAnExplicitRejectionEvenForLocalhostOrEncodedKeys() throws Exception {
+        String[] values = {"http://10.0.0.1:4318/#owner=" + TOKEN,
+                "http://localhost:4318/#owner=" + TOKEN,
+                "http://127.0.0.1:4318/#%6fWNER=" + TOKEN,
+                "http://10.0.0.1:4318/#unsupported=value&owner=" + TOKEN,
+                "lanrelay://connect?url=" + URLEncoder.encode("http://10.0.0.1:4318/#owner=" + TOKEN, "UTF-8")};
+        for (String value : values) {
+            LinkPolicy.OwnerLinkException error = assertThrows(LinkPolicy.OwnerLinkException.class,
+                    () -> LinkPolicy.connection(value));
+            assertFalse(error.getMessage().contains(TOKEN));
+        }
+        IllegalArgumentException ordinaryText = assertThrows(IllegalArgumentException.class,
+                () -> LinkPolicy.connection("请与 owner 核对测试结果。"));
+        assertFalse(ordinaryText instanceof LinkPolicy.OwnerLinkException);
+    }
+
     @Test public void acceptsPrivateIpv6AndVpnButNotPublicIpv6() {
         assertEquals("http://[fd12:3456::1]:4318", LinkPolicy.connection("http://[fd12:3456::1]:4318").origin);
         assertEquals("http://100.64.1.2:4318", LinkPolicy.connection("http://100.64.1.2:4318").origin);
