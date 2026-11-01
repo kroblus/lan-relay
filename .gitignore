@@ -1,0 +1,14 @@
+node_modules/
+.lan-relay-data/
+.env
+.env.*
+!.env.example
+coverage/
+output/
+*.log
+*.sqlite
+*.sqlite-*
+*.pem
+*.key
+.DS_Store
+Thumbs.db
