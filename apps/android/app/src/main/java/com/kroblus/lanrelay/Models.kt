@@ -14,20 +14,22 @@ data class Session(val origin: String, val serverId: String, val serverName: Str
     companion object { fun parse(j: JSONObject) = Session(j.getString("origin"), j.getString("server_id"), j.string("server_name"), j.getString("device_id"), j.getString("token")) }
 }
 
-data class PendingPair(val origin: String, val serverId: String, val serverName: String, val id: String, val claimToken: String, val expiresAt: Long) {
+data class PendingPair(val origin: String, val serverId: String, val serverName: String, val id: String, val claimToken: String, val expiresAt: Long, val verificationCode: String = "", val cancelRequested: Boolean = false) {
     fun json() = JSONObject().put("origin", origin).put("server_id", serverId).put("server_name", serverName)
-        .put("id", id).put("claim_token", claimToken).put("expires_at", expiresAt)
-    companion object { fun parse(j: JSONObject) = PendingPair(j.getString("origin"), j.getString("server_id"), j.string("server_name"), j.getString("id"), j.getString("claim_token"), j.getLong("expires_at")) }
+        .put("id", id).put("claim_token", claimToken).put("expires_at", expiresAt).put("verification_code", verificationCode).put("cancel_requested", cancelRequested)
+    companion object { fun parse(j: JSONObject) = PendingPair(j.getString("origin"), j.getString("server_id"), j.string("server_name"), j.getString("id"), j.getString("claim_token"), j.getLong("expires_at"), j.string("verification_code"), j.optBoolean("cancel_requested")) }
 }
 
-data class Hello(val protocol: Int, val serverId: String, val name: String, val maxFileBytes: Long, val chunkSize: Int) {
+data class Hello(val protocol: Int, val serverId: String, val name: String, val maxFileBytes: Long, val chunkSize: Int, val capabilities: Set<String> = emptySet()) {
     companion object {
         fun parse(j: JSONObject): Hello {
             require(j.getInt("protocol_version") == 2) { "电脑协议不兼容，请更新电脑或手机应用。" }
             val size = j.getLong("max_file_bytes")
             val chunk = j.getInt("chunk_size")
             require(size > 0 && chunk in 1..(16 * 1024 * 1024)) { "电脑返回了无效传输限制。" }
-            return Hello(2, j.getString("server_id"), j.getString("name"), size, minOf(chunk, 8 * 1024 * 1024))
+            val capabilities = j.optJSONArray("capabilities")
+            return Hello(2, j.getString("server_id"), j.getString("name"), size, minOf(chunk, 8 * 1024 * 1024),
+                if (capabilities == null) emptySet() else (0 until capabilities.length()).map { capabilities.getString(it) }.toSet())
         }
     }
 }
@@ -70,7 +72,7 @@ data class TransferTask(
     val status: String = "queued", val error: String = "", val savedUri: String = "", val persistedUri: Boolean = false,
     val cancelPending: Boolean = false
 ) {
-    val active get() = status in setOf("hashing", "uploading", "downloading", "verifying", "saving")
+    val active get() = status in setOf("hashing", "uploading", "downloading", "retrying", "verifying", "saving")
     val terminal get() = status == "complete" || status == "cancelled"
     val clearable get() = terminal && !cancelPending
     fun afterProcessRestart() = if (active || status == "queued") copy(status = "paused", error = "应用已重新启动，点继续恢复任务。") else this
@@ -87,6 +89,18 @@ data class TransferTask(
 }
 
 object TransferRules {
+    fun resume(task: TransferTask, session: Session): TransferTask {
+        validateIdentity(task, session)
+        return if (task.status in setOf("paused", "failed")) task.copy(status = "queued", error = "") else task
+    }
+    /** Once a verified file is publicly saved, report that durable outcome even
+     * if pause/cancel raced the final metadata update. No installation is inferred. */
+    fun savedDownload(task: TransferTask, uri: String, size: Long, sha256: String): TransferTask {
+        require(task.direction != "upload" && uri.startsWith("content://"))
+        if (task.direction != "export") require(size == task.size && sha256 == task.sha256)
+        return task.copy(status = "complete", savedUri = uri, size = size, offset = size, sha256 = sha256,
+            cancelPending = false, error = if (task.direction == "export") "反馈已导出到下载目录。" else "SHA-256 一致，文件已完成保存。")
+    }
     fun downloadHeaders(offset: Long, sha256: String): Map<String, String> = if (offset > 0)
         mapOf("Range" to "bytes=$offset-", "If-Range" to "\"sha256-$sha256\"") else emptyMap()
     fun validateIdentity(task: TransferTask, session: Session) {

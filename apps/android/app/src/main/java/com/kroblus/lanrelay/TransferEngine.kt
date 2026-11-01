@@ -9,6 +9,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.InputStream
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,7 +55,7 @@ class TransferEngine(private val context: Context, private val store: RelayStore
         } catch (error: Exception) {
             val current = store.task(task.id)
             if (current?.status !in setOf("paused", "cancelled")) {
-                val status = if (error is SourceUnavailable || error is SecurityException || error is FileNotFoundException) "needs_file" else "failed"
+                val status = if (task.direction == "upload" && (error is SourceUnavailable || error is SecurityException || error is FileNotFoundException)) "needs_file" else "failed"
                 store.update(task.id) { it.copy(status = status, error = error.message?.take(300) ?: "传输中断，请重试。") }
             }
         } finally {
@@ -123,7 +124,7 @@ class TransferEngine(private val context: Context, private val store: RelayStore
             openSource(task).use { input ->
                 skipExactly(input, remote.offset)
                 // A provider may have to read to seek; source positioning is not network speed.
-                val meter = ThroughputMeter(size, remote.offset, elapsedMillis())
+                var telemetry = NetworkTelemetry(size, remote.offset, elapsedMillis())
                 store.setMetrics(activeId, TransferMetrics())
                 while (remote.offset < size) {
                     checkpoint()
@@ -131,11 +132,19 @@ class TransferEngine(private val context: Context, private val store: RelayStore
                     require(count > 0) { "原文件在传输期间变短，请重新选择原始文件。" }
                     try {
                         val before = remote.offset
-                        val next = api.sendChunk(remote.id, before, buffer, count)
+                        var lastWritten = 0L
+                        val next = api.sendChunk(remote.id, before, buffer, count) { written ->
+                            checkpoint()
+                            val now = elapsedMillis()
+                            // OkHttp may retry a request stream before returning a response.
+                            // Restart display sampling without advancing any confirmed offset.
+                            if (written < lastWritten) telemetry = NetworkTelemetry(size, before, now)
+                            lastWritten = written
+                            telemetry.observe(before + written, now)?.let { store.setMetrics(activeId, it) }
+                        }
                         require(next.offset == before + count && next.size == size && next.sha256 == sha) { "电脑返回了不一致的已确认进度。" }
                         remote = next
                         update(progressOnly = true) { it.copy(offset = remote.offset, error = "") }
-                        store.setMetrics(activeId, meter.sample(remote.offset, elapsedMillis()))
                         conflicts = 0
                     } catch (error: ApiFailure) {
                         if (error.status != 409 || ++conflicts > 3) throw error
@@ -164,18 +173,23 @@ class TransferEngine(private val context: Context, private val store: RelayStore
         val path = if (export) "/api/v2/feedback/${LinkPolicy.id(task.itemId)}/export" else "/api/v2/files/${LinkPolicy.id(task.itemId)}"
         if (!export) require(task.size >= 0 && task.sha256.matches(Regex("[0-9a-f]{64}"))) { "文件缺少可验证的长度或 SHA-256。" }
         val part = partialFile(task)
-        var offset = if (!export && part.exists() && part.length() <= task.size) part.length() else 0L
         val maximum = if (export) 4L * 1024 * 1024 else task.size
-        update { it.copy(status = "downloading", offset = offset, error = "") }
-        var meter = ThroughputMeter(task.size, offset, elapsedMillis())
-        val headers = TransferRules.downloadHeaders(offset, task.sha256)
-        if (offset < maximum || export || !part.exists()) {
-            api.execute(path, headers = headers).use { response ->
+        var retries = 0
+        while (true) {
+            checkpoint()
+            var offset = if (!export && part.exists() && part.length() <= task.size) part.length() else 0L
+            update { it.copy(status = "downloading", offset = offset, error = "") }
+            var telemetry = NetworkTelemetry(task.size, offset, elapsedMillis())
+            val headers = TransferRules.downloadHeaders(offset, task.sha256)
+            try {
+            if (retries > 0) network { api.verifyServer(task.serverId) }
+            if (offset < maximum || export || !part.exists()) network { api.execute(path, headers = headers) }.use { response ->
                 if (!response.isSuccessful) api.parseResponse(response)
                 require(response.header("Content-Disposition").orEmpty().startsWith("attachment;", ignoreCase = true)) { "电脑返回的不是文件附件。" }
+                if (!export) require(response.header("ETag") == "\"sha256-${task.sha256}\"") { "电脑上的文件身份发生变化，请刷新后重新选择。" }
                 if (offset > 0 && response.code == 200) {
                     offset = 0
-                    meter = ThroughputMeter(task.size, 0, elapsedMillis())
+                    telemetry = NetworkTelemetry(task.size, 0, elapsedMillis())
                 }
                 if (offset > 0) {
                     val range = Regex("bytes (\\d+)-(\\d+)/(\\d+)").matchEntire(response.header("Content-Range").orEmpty())
@@ -185,27 +199,41 @@ class TransferEngine(private val context: Context, private val store: RelayStore
                 RandomAccessFile(part, "rw").use { output ->
                     output.setLength(offset)
                     output.seek(offset)
-                    body.byteStream().use { input ->
+                    try { body.byteStream().use { input ->
                         val buffer = ByteArray(256 * 1024)
                         var checkpointBytes = offset
                         while (true) {
                             checkpoint()
-                            val count = input.read(buffer)
+                            val count = network { input.read(buffer) }
                             if (count < 0) break
                             if (count == 0) continue
                             require(offset + count <= maximum) { "下载内容超过声明的文件大小。" }
+                            // Activity is based on received bytes, not the much less frequent
+                            // 2 MiB durability checkpoint. This is an in-memory UI signal only.
+                            telemetry.observe(offset + count, elapsedMillis())?.let { store.setMetrics(activeId, it) }
                             output.write(buffer, 0, count)
                             offset += count
                             if (offset - checkpointBytes >= 2 * 1024 * 1024) {
                                 output.fd.sync()
                                 update(progressOnly = true) { it.copy(offset = offset) }
-                                store.setMetrics(activeId, meter.sample(offset, elapsedMillis()))
                                 checkpointBytes = offset
                             }
                         }
-                        output.fd.sync()
-                    }
+                    } } finally { output.fd.sync() }
                 }
+            }
+            if (!export && part.length() != task.size) throw DownloadTransportFailure(IOException("连接提前结束，正在恢复下载。"))
+            break
+            } catch (error: Exception) {
+                checkpoint()
+                val wait = DownloadRetryPolicy.delayMillis(error, retries) ?: throw error
+                retries++
+                store.setMetrics(activeId, null)
+                update { it.copy(status = "retrying", offset = if (part.exists()) part.length() else 0L,
+                    error = "连接暂时中断，正在自动续传（$retries / 3）…") }
+                // Short cancellable waits retain pause/cancel responsiveness during backoff.
+                val until = elapsedMillis() + wait
+                while (elapsedMillis() < until) { checkpoint(); Thread.sleep(minOf(100, until - elapsedMillis()).coerceAtLeast(1)) }
             }
         }
         checkpoint()
@@ -219,16 +247,26 @@ class TransferEngine(private val context: Context, private val store: RelayStore
             update { it.copy(offset = 0) }
             throw error
         }
-        update { it.copy(status = "complete", savedUri = saved.toString(), size = part.length(), offset = part.length(), sha256 = hash,
-            error = if (export) "反馈已导出到下载目录。" else "SHA-256 一致，已保存到下载目录。") }
+        // saveToDownloads returned only after full verification and publication.
+        // Do not leave a published file attached to a late "cancelled" record that
+        // can be cleared, or a "paused" record whose completed part would disappear.
+        val recorded = store.finishSavedDownload(activeId, saved.toString(), part.length(), hash)
+        // A cancelled record may already have been cleared before this atomic
+        // finalization. Remove only this newly published file in that case. A
+        // record cleared AFTER completion must leave its saved file untouched.
+        if (!recorded) context.contentResolver.delete(saved, null, null)
         part.delete()
     }
+
+    private inline fun <T> network(block: () -> T): T = try { block() }
+        catch (error: ApiFailure) { throw error }
+        catch (error: IOException) { throw DownloadTransportFailure(error) }
 
     private fun saveToDownloads(file: File, task: TransferTask): Pair<Uri, String> {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, "${System.currentTimeMillis()}-${TransferRules.safeName(task.name)}")
-            put(MediaStore.Downloads.MIME_TYPE, task.mime)
+            put(MediaStore.Downloads.MIME_TYPE, FileOpenPolicy.mime(task.name, task.mime))
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/LANRelay")
             put(MediaStore.Downloads.IS_PENDING, 1)
         }

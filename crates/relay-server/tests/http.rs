@@ -152,6 +152,233 @@ async fn native_pairing_unicode_and_origin_boundaries() {
 }
 
 #[tokio::test]
+async fn discovery_pairing_requires_owner_decision_and_checks_boundaries() {
+    let (_dir, core, server, client, base, existing_token) = fixture().await;
+    assert!(core
+        .hello()
+        .capabilities
+        .contains(&"discovery_pairing".to_owned()));
+    let request = NewDiscoveryPairRequest {
+        name: "附近的测试手机".into(),
+        peer_id: Uuid::new_v4().to_string(),
+        server_id: core.hello().server_id,
+    };
+    let url = format!("{base}/api/v2/pair/discovery");
+    assert_eq!(
+        client
+            .post(&url)
+            .header("Origin", "https://unrelated.example")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let ticket: PairTicket = client
+        .post(&url)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ticket.verification_code.as_ref().unwrap().len(), 6);
+    let claim = ClaimRequest {
+        id: ticket.id.clone(),
+        claim_token: ticket.claim_token.clone(),
+    };
+    let pending: PairClaim = client
+        .post(format!("{base}/api/v2/pair/claim"))
+        .json(&claim)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending.status, "pending");
+    assert!(pending.token.is_none());
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v2/state"))
+            .bearer_auth(ticket.verification_code.as_ref().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let peer_state: Snapshot = client
+        .get(format!("{base}/api/v2/state"))
+        .bearer_auth(&existing_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(peer_state.pair_requests.is_empty());
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    core.decide_pair(&ticket.id, true).unwrap();
+    let approved: PairClaim = client
+        .post(format!("{base}/api/v2/pair/claim"))
+        .json(&claim)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(approved.status, "approved");
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v2/state"))
+            .bearer_auth(approved.token.unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut wrong_server = request.clone();
+    wrong_server.server_id = Uuid::new_v4().to_string();
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&wrong_server)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let mut oversized = request.clone();
+    oversized.name = "a".repeat(5000);
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&oversized)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn discovery_and_legacy_pairing_share_a_bounded_creation_rate() {
+    let (_dir, core, server, client, base, _token) = fixture().await;
+    // fixture() already used one creation from the same source address.
+    for _ in 0..11 {
+        let request = NewDiscoveryPairRequest {
+            name: "测试手机".into(),
+            peer_id: Uuid::new_v4().to_string(),
+            server_id: core.hello().server_id,
+        };
+        assert_eq!(
+            client
+                .post(format!("{base}/api/v2/pair/discovery"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let invite = core.create_invite().unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v2/pair/requests"))
+            .json(&NewPairRequest {
+                name: "二维码请求".into(),
+                code: Some(invite.code),
+                token: None
+            })
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pending_pair_cancellation_requires_claim_proof_and_allows_immediate_retry() {
+    let (_dir, core, server, client, base, _token) = fixture().await;
+    let request = NewDiscoveryPairRequest {
+        name: "测试手机".into(),
+        peer_id: Uuid::new_v4().to_string(),
+        server_id: core.hello().server_id,
+    };
+    let ticket: PairTicket = client
+        .post(format!("{base}/api/v2/pair/discovery"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v2/pair/cancel"))
+            .json(&ClaimRequest {
+                id: ticket.id.clone(),
+                claim_token: "x".repeat(43)
+            })
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let cancelled: PairClaim = client
+        .post(format!("{base}/api/v2/pair/cancel"))
+        .json(&ClaimRequest {
+            id: ticket.id,
+            claim_token: ticket.claim_token,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, "rejected");
+    assert!(cancelled.token.is_none());
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v2/pair/discovery"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn upload_retry_download_head_range_and_integrity() {
     let (_dir, core, server, client, base, token) = fixture().await;
     let bytes = (0..256 * 1024 + 17)

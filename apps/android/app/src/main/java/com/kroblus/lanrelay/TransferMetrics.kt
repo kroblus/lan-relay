@@ -5,7 +5,7 @@ import java.io.OutputStream
 import java.security.MessageDigest
 import kotlin.math.max
 
-/** A display sample of acknowledged network bytes, never pre-hash or disk-copy speed. */
+/** In-memory network activity, never a durable offset or pre-hash/disk-copy progress. */
 data class TransferMetrics(val bytesPerSecond: Double = 0.0, val remainingSeconds: Long? = null, val elapsedMillis: Long = 0,
     val lastProgressAt: Long = 0)
 
@@ -13,11 +13,11 @@ internal class ThroughputMeter(private val total: Long, offset: Long, private va
     private var sampledAt = started
     private var sampledOffset = offset
     private var rate = 0.0
-    private var confirmedOffset = offset
+    private var observedOffset = offset
     private var lastProgressAt = started
     fun sample(offset: Long, now: Long): TransferMetrics {
-        if (offset > confirmedOffset) {
-            confirmedOffset = offset
+        if (offset > observedOffset) {
+            observedOffset = offset
             lastProgressAt = now
         }
         val delta = now - sampledAt
@@ -29,6 +29,23 @@ internal class ThroughputMeter(private val total: Long, offset: Long, private va
         }
         return TransferMetrics(rate, if (rate > 0.0 && total >= 0) (max(0L, total - offset) / rate).toLong() else null,
             max(0, now - started), lastProgressAt)
+    }
+}
+
+/** Throttle UI telemetry independently of fsync / server acknowledgements. */
+internal class NetworkTelemetry(total: Long, offset: Long, started: Long) {
+    private val meter = ThroughputMeter(total, offset, started)
+    private var lastOffset = offset
+    private var publishedAt = started
+
+    fun observe(offset: Long, now: Long): TransferMetrics? {
+        // A timer or repeated callback must never make an idle connection look active.
+        if (offset <= lastOffset) return null
+        lastOffset = offset
+        val sample = meter.sample(offset, now)
+        if (now - publishedAt < 500) return null
+        publishedAt = now
+        return sample
     }
 }
 

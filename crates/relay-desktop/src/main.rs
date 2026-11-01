@@ -29,6 +29,8 @@ pub struct Host {
     pub port: u16,
     pub sender: UnboundedSender<Signal>,
     pub server: Mutex<Option<relay_server::ServerHandle>>,
+    pub discovery: Option<relay_server::discovery::DiscoveryHandle>,
+    pub discovery_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -119,6 +121,18 @@ fn run() -> Result<(), String> {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), options.port),
         ))
         .map_err(|e| format!("无法监听端口 {}：{e}", options.port))?;
+    let hello = relay.hello();
+    let (discovery, discovery_error) = match runtime.block_on(relay_server::discovery::start(
+        hello.server_id,
+        hello.name,
+        options.port,
+    )) {
+        Ok(handle) => (Some(handle), None),
+        Err(error) => (
+            None,
+            Some(format!("设备发现暂不可用：{error}。仍可扫码或手动连接。")),
+        ),
+    };
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     SIGNALS
         .set(Mutex::new(Some(receiver)))
@@ -151,6 +165,8 @@ fn run() -> Result<(), String> {
         port: options.port,
         sender,
         server: Mutex::new(Some(server)),
+        discovery,
+        discovery_error,
     });
     let app_host = host.clone();
     let result = iced::daemon(

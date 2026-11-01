@@ -11,6 +11,8 @@ pub struct Preferences {
     pub project: String,
     pub address: String,
     pub pending_files: Vec<QueuedFile>,
+    pub draft_files: Vec<PathBuf>,
+    pub reduce_motion: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -35,6 +37,7 @@ impl Preferences {
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok());
         let mut value = value.unwrap_or_default();
         value.pending_files.truncate(64);
+        value.draft_files.truncate(64);
         value
     }
 
@@ -111,11 +114,15 @@ mod tests {
         preferences.save(dir.path()).unwrap();
         let identity = preferences.pending_files[0].request_id.clone();
         preferences.project = "项目乙".into();
+        preferences.draft_files = vec![dir.path().join("尚未发送.apk")];
+        preferences.reduce_motion = true;
         preferences.save(dir.path()).unwrap();
         let restored = Preferences::load(dir.path());
         assert_eq!(restored.project, "项目乙");
         assert_eq!(restored.pending_files[0].project, "项目甲");
         assert_eq!(restored.pending_files[0].request_id, identity);
+        assert_eq!(restored.draft_files, preferences.draft_files);
+        assert!(restored.reduce_motion);
         assert!(!dir.path().join("desktop-preferences.tmp").exists());
     }
 }

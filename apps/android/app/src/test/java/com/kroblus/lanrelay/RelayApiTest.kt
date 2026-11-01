@@ -13,6 +13,46 @@ import java.util.concurrent.TimeUnit
 
 /** Real HTTP requests against an isolated local fixture; no user files, credentials or relay server. */
 class RelayApiTest {
+    @Test fun uploadReportsBoundedNetworkActivityBeforeTheServerAcknowledges() {
+        val count = 150 * 1024
+        val received = java.util.concurrent.CountDownLatch(1)
+        val acknowledge = java.util.concurrent.CountDownLatch(1)
+        val progress = java.util.concurrent.CopyOnWriteArrayList<Long>()
+        Fixture(200, """{"id":"u1","offset":$count,"size":$count,"chunk_size":8388608,"status":"uploading","sha256":"abc"}""",
+            beforeResponse = { received.countDown(); check(acknowledge.await(3, TimeUnit.SECONDS)) }).use { server ->
+            val send = java.util.concurrent.FutureTask<RemoteUpload> {
+                RelayApi(server.origin, "fixture-session-token").sendChunk("u1", 0, ByteArray(count + 13), count) { progress += it }
+            }
+            val worker = Thread(send).apply { start() }
+            try {
+                assertTrue(received.await(3, TimeUnit.SECONDS))
+                assertFalse("A complete request body is not a durable server acknowledgement", send.isDone)
+                assertEquals(0L, progress.first())
+                assertEquals(count.toLong(), progress.last())
+                assertTrue(progress.zipWithNext().all { (before, after) -> after - before in 1..(64 * 1024L) })
+                assertEquals(count, server.body.poll(3, TimeUnit.SECONDS)!!.size)
+                acknowledge.countDown()
+                assertEquals(count.toLong(), send.get(3, TimeUnit.SECONDS).offset)
+            } finally { acknowledge.countDown(); worker.join(1000) }
+        }
+    }
+    @Test fun healthyDownloadOutlivesWholeCallDeadline() {
+        Fixture(200, "abcdefghij", bytesPerChunk = 1, delayMillis = 60).use { server ->
+            RelayApi(server.origin, "fixture-session-token", controlTimeoutMillis = 200)
+                .execute("/api/v2/files/large-file").use { response ->
+                    assertEquals("abcdefghij", response.body!!.string())
+                }
+        }
+    }
+
+    @Test fun metadataStillHasBoundedWholeCallDeadline() {
+        Fixture(200, "{\"items\":[]}", bytesPerChunk = 1, delayMillis = 60).use { server ->
+            assertThrows(java.io.IOException::class.java) {
+                RelayApi(server.origin, "fixture-session-token", controlTimeoutMillis = 200).json("/api/v2/items")
+            }
+        }
+    }
+
     @Test fun bearerCredentialStaysInHeader() {
         Fixture(200, """{"items":[],"next_cursor":null}""").use { server ->
             RelayApi(server.origin, "fixture-session-token").json("/api/v2/items?limit=50")
@@ -87,7 +127,8 @@ class RelayApiTest {
         assertTrue(TransferRules.downloadHeaders(0, hash).isEmpty())
     }
 
-    private class Fixture(status: Int, responseBody: String, responseHeaders: Map<String, String> = emptyMap()) : Closeable {
+    private class Fixture(status: Int, responseBody: String, responseHeaders: Map<String, String> = emptyMap(), bytesPerChunk: Int = Int.MAX_VALUE, delayMillis: Long = 0,
+        beforeResponse: (() -> Unit)? = null) : Closeable {
         val request = LinkedBlockingQueue<List<String>>()
         val body = LinkedBlockingQueue<ByteArray>()
         private val server: ServerSocket
@@ -118,13 +159,22 @@ class RelayApiTest {
                         while (received < length) { val count = input.read(bytes, received, length - received); if (count < 0) break; received += count }
                         request.put(lines)
                         body.put(bytes)
+                        beforeResponse?.invoke()
                         val payload = responseBody.toByteArray(Charsets.UTF_8)
                         val response = buildString {
                             append("HTTP/1.1 $status Fixture\r\nContent-Type: application/json\r\nContent-Length: ${payload.size}\r\nConnection: close\r\n")
                             responseHeaders.forEach { (key, value) -> append("$key: $value\r\n") }
                             append("\r\n")
                         }
-                        socket.getOutputStream().apply { write(response.toByteArray(Charsets.UTF_8)); write(payload); flush() }
+                        socket.getOutputStream().apply {
+                            write(response.toByteArray(Charsets.UTF_8)); flush()
+                            var sent = 0
+                            while (sent < payload.size) {
+                                val count = minOf(bytesPerChunk, payload.size - sent)
+                                write(payload, sent, count); flush(); sent += count
+                                if (delayMillis > 0 && sent < payload.size) Thread.sleep(delayMillis)
+                            }
+                        }
                     }
                 }
             }.apply { isDaemon = true; start() }

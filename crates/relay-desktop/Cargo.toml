@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 relay-core = { path = "../relay-core" }
 relay-server = { path = "../relay-server" }
-iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "qr_code", "advanced-shaping", "x11", "wayland"] }
+iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "lazy", "tokio", "qr_code", "advanced-shaping", "x11", "wayland"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,4 +1,5 @@
 //! Versioned native-client LAN protocol. Owner actions are intentionally absent.
+pub mod discovery;
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
@@ -13,8 +14,8 @@ use axum::{
 };
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use relay_core::{
-    AuthenticatedSession, ClaimRequest, NewFeedback, NewPairRequest, NewText, NewUpload, PatchItem,
-    Relay, RelayError,
+    AuthenticatedSession, ClaimRequest, NewDiscoveryPairRequest, NewFeedback, NewPairRequest,
+    NewText, NewUpload, PatchItem, Relay, RelayError,
 };
 use serde::Deserialize;
 use std::{
@@ -38,6 +39,7 @@ struct AppState {
     requests: Arc<Semaphore>,
     downloads: Arc<Semaphore>,
     pairing_rates: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
+    claim_rates: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
 }
 
 pub struct ServerHandle {
@@ -104,11 +106,26 @@ pub fn router(relay: Arc<Relay>) -> Router {
         requests: Arc::new(Semaphore::new(32)),
         downloads: Arc::new(Semaphore::new(8)),
         pairing_rates: Arc::new(Mutex::new(HashMap::new())),
+        claim_rates: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/api/v2/hello", get(hello))
-        .route("/api/v2/pair/requests", post(pair_request))
-        .route("/api/v2/pair/claim", post(pair_claim))
+        .route(
+            "/api/v2/pair/requests",
+            post(pair_request).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v2/pair/discovery",
+            post(discovery_pair).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v2/pair/claim",
+            post(pair_claim).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v2/pair/cancel",
+            post(pair_cancel).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/api/v2/state", get(snapshot))
         .route("/api/v2/items", get(items))
         .route("/api/v2/text", post(text))
@@ -278,37 +295,75 @@ async fn pair_request(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(input): Json<NewPairRequest>,
 ) -> ApiResult<Json<relay_core::PairTicket>> {
-    {
-        let mut rates = state
-            .pairing_rates
-            .lock()
-            .map_err(|_| ApiError(RelayError::new(503, "SERVER_BUSY", "服务繁忙")))?;
-        let now = Instant::now();
-        rates.retain(|_, v| now.duration_since(v.0) < Duration::from_secs(60));
-        if rates.len() >= 1024 && !rates.contains_key(&peer.ip()) {
-            return Err(ApiError(RelayError::new(
-                429,
-                "PAIR_RATE_LIMIT",
-                "连接请求过多，请稍后重试",
-            )));
-        }
-        let entry = rates.entry(peer.ip()).or_insert((now, 0));
-        entry.1 += 1;
-        if entry.1 > 12 {
-            return Err(ApiError(RelayError::new(
-                429,
-                "PAIR_RATE_LIMIT",
-                "连接请求过于频繁，请一分钟后重试",
-            )));
-        }
-    }
+    rate_pairing(&state, peer.ip(), false)?;
     Ok(Json(work(&state, move |r| r.request_pair(input)).await?))
+}
+
+fn rate_pairing(state: &AppState, peer: IpAddr, claim: bool) -> ApiResult<()> {
+    let mut rates = if claim {
+        &state.claim_rates
+    } else {
+        &state.pairing_rates
+    }
+    .lock()
+    .map_err(|_| ApiError(RelayError::new(503, "SERVER_BUSY", "服务繁忙")))?;
+    let now = Instant::now();
+    rates.retain(|_, v| now.duration_since(v.0) < Duration::from_secs(60));
+    if rates.len() >= 1024 && !rates.contains_key(&peer) {
+        return Err(ApiError(RelayError::new(
+            429,
+            "PAIR_RATE_LIMIT",
+            "连接请求过多，请稍后重试",
+        )));
+    }
+    let entry = rates.entry(peer).or_insert((now, 0));
+    entry.1 = entry.1.saturating_add(1);
+    if entry.1 > if claim { 120 } else { 12 } {
+        return Err(ApiError(RelayError::new(
+            429,
+            "PAIR_RATE_LIMIT",
+            "连接请求过于频繁，请一分钟后重试",
+        )));
+    }
+    Ok(())
+}
+
+async fn discovery_pair(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(input): Json<NewDiscoveryPairRequest>,
+) -> ApiResult<Json<relay_core::PairTicket>> {
+    rate_pairing(&state, peer.ip(), false)?;
+    let is_local = match peer.ip() {
+        IpAddr::V4(ip) => discovery::private_ipv4(ip) || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_loopback(),
+    };
+    if !is_local {
+        return Err(ApiError(RelayError::new(
+            403,
+            "LAN_REQUIRED",
+            "请在同一局域网内连接设备",
+        )));
+    }
+    Ok(Json(
+        work(&state, move |r| r.request_discovery_pair(input)).await?,
+    ))
 }
 async fn pair_claim(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(input): Json<ClaimRequest>,
 ) -> ApiResult<Json<relay_core::PairClaim>> {
+    rate_pairing(&state, peer.ip(), true)?;
     Ok(Json(work(&state, move |r| r.claim_pair(input)).await?))
+}
+async fn pair_cancel(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(input): Json<ClaimRequest>,
+) -> ApiResult<Json<relay_core::PairClaim>> {
+    rate_pairing(&state, peer.ip(), true)?;
+    Ok(Json(work(&state, move |r| r.cancel_pair(input)).await?))
 }
 async fn snapshot(
     State(state): State<AppState>,

@@ -2,6 +2,8 @@ package com.kroblus.lanrelay
 
 import android.app.Application
 import android.net.Uri
+import android.content.Intent
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +19,10 @@ import org.json.JSONObject
 
 class RelayViewModel(application: Application) : AndroidViewModel(application) {
     val store = (application as RelayApp).store
+    private val discoveryId = store.preferences.getString("discovery_peer_id", null) ?: java.util.UUID.randomUUID().toString().also {
+        store.preferences.edit().putString("discovery_peer_id", it).apply()
+    }
+    val discovery = LanDiscovery(discoveryId) { store.preferences.getString("device_name", "我的手机").orEmpty() }
     val items = MutableStateFlow<List<FeedItem>>(emptyList())
     val busy = MutableStateFlow(false)
     val online = MutableStateFlow(false)
@@ -24,8 +30,10 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     val incomingAddress = MutableStateFlow("")
     val sharedFiles = MutableStateFlow<List<Uri>>(emptyList())
     val sharedText = MutableStateFlow("")
+    val stagedNames = MutableStateFlow<Map<String, String>>(emptyMap())
     private val visible = MutableStateFlow(false)
     private val refreshLock = Mutex()
+    private val draftSubmission = DraftSubmissionGate()
     private var nextCursor: String? = null
     private var feedIdentity = ""
 
@@ -41,7 +49,60 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun visible(value: Boolean) { visible.value = value }
+    fun startDiscovery() { if (visible.value) discovery.start() }
+    fun stopDiscovery() { discovery.close() }
+    override fun onCleared() { discovery.close(); super.onCleared() }
     fun message(value: String) { store.notice.value = value }
+
+    fun stageFiles(uris: List<Uri>) = action {
+        val selected = (sharedFiles.value + uris).distinct()
+        require(selected.size <= 100) { "单次最多添加 100 个文件。" }
+        val resolver = getApplication<Application>().contentResolver
+        val names = selected.associate { uri ->
+            require(uri.scheme == "content") { "请选择系统文件选择器提供的文件。" }
+            runCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            var name = "文件"
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) name = cursor.getString(0).orEmpty().ifBlank { "文件" }
+            }
+            uri.toString() to name
+        }
+        stagedNames.value = names
+        sharedFiles.value = selected
+    }
+
+    fun sendDraft(text: String, project: String, requestId: String, selectedFiles: List<Uri>, expectedSession: Session,
+        done: () -> Unit, started: () -> Unit) {
+        // Acquire before scheduling the coroutine; a second tap can arrive before
+        // Compose sees busy=true. Pause/cancel operations never share this gate.
+        if (!draftSubmission.acquire()) return
+        action { try {
+        val files = selectedFiles.toList()
+        require(text.isNotBlank() || files.isNotEmpty()) { "添加文件，或写一段文字后发送。" }
+        val session = expectedSession
+        requireSession(session)
+        refreshLock.withLock {
+            requireSession(session)
+            // Prepare the entire selection before mutating the durable queue, so a
+            // revoked file URI cannot leave half the selection queued twice.
+            val prepared = files.map { DraftTaskIdentity.bind(store.prepareFile(it, project), requestId) }
+            val newCount = prepared.count { incoming -> store.tasks.value.none { it.id == incoming.id } }
+            require(store.tasks.value.size + newCount <= 500) { "请先清理已完成记录，再发送更多文件。" }
+            if (text.isNotBlank()) verifiedApi(session).json("/api/v2/text", "POST",
+                JSONObject().put("text", text).put("project", project).put("request_id", requestId))
+            requireSession(session)
+            if (prepared.isNotEmpty()) store.addAll(prepared)
+        }
+        withContext(Dispatchers.Main) {
+            requireSession(session)
+            sharedFiles.value = sharedFiles.value.filterNot { it in files }
+            done()
+            if (files.isNotEmpty()) started()
+        }
+        message(if (files.isNotEmpty()) "已开始发送 ${files.size} 个文件${if (text.isNotBlank()) "，文字已送达" else ""}。" else "文字已送达。")
+        refresh()
+        } finally { draftSubmission.release() } }
+    }
 
     private fun identity(session: Session) = session.serverId + ":" + session.deviceId
     private fun requireSession(session: Session) {
@@ -58,7 +119,8 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     private suspend fun activateSession(session: Session?, expectedPair: String? = null): Boolean = refreshLock.withLock {
-        if (expectedPair != null && store.pending.value?.id != expectedPair) return@withLock false
+        if (expectedPair != null && (store.pending.value?.id != expectedPair || store.pending.value?.cancelRequested == true)) return@withLock false
+        if (store.session.value != session) store.pauseAll("连接已切换，原电脑的任务和断点保留。")
         // Clear the old computer's actions before publishing the new authenticated identity.
         items.value = emptyList()
         nextCursor = null
@@ -70,6 +132,7 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect(address: String, name: String, code: String) = action {
+        require(store.pending.value == null) { "正在等待电脑确认，请先完成或取消当前连接。" }
         val link = LinkPolicy.parse(address)
         require(name.trim().isNotEmpty() && name.length <= 80) { "请填写 1–80 个字符的设备名称。" }
         store.pauseAll("连接已切换，请回到原电脑后继续旧任务。")
@@ -88,7 +151,11 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
                 if (error.status != 401 && error.status != 403) throw error
             }
         }
-        if (link.inviteToken.isEmpty()) require(code.matches(Regex("[0-9]{6}"))) { "请输入电脑当前显示的六位连接码。" }
+        if (link.inviteToken.isEmpty() && code.isBlank() && "discovery_pairing" in hello.capabilities) {
+            requestDiscoveryPair(api, hello, name)
+            return@action
+        }
+        if (link.inviteToken.isEmpty()) require(code.matches(Regex("[0-9]{6}"))) { "旧版电脑需要当前六位连接码，更新电脑端后可免输入。" }
         val payload = JSONObject().put("name", name.trim())
         if (link.inviteToken.isNotEmpty()) payload.put("token", link.inviteToken) else payload.put("code", code)
         val result = api.json("/api/v2/pair/requests", "POST", payload, authenticated = false)
@@ -97,14 +164,47 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         message("配对请求已发送，请在电脑窗口批准。")
     }
 
+    fun connectDiscovered(peer: NearbyDesktop, name: String) = action {
+        require(name.trim().isNotEmpty() && name.length <= 80) { "请填写 1–80 个字符的设备名称。" }
+        require(store.pending.value == null) { "正在等待电脑确认，请先完成或取消当前连接。" }
+        val api = RelayApi(peer.origin)
+        val hello = api.verifyServer(peer.id)
+        store.connections.value.firstOrNull { it.serverId == hello.serverId }?.let { known ->
+            val candidate = known.copy(origin = peer.origin, serverName = hello.name)
+            try {
+                RelayApi.verified(candidate).json("/api/v2/state")
+                store.pauseAll("连接已切换，原任务保留。")
+                activateSession(candidate)
+                message("已连接 ${hello.name}，无需重复验证。")
+                return@action
+            } catch (error: ApiFailure) { if (error.status !in setOf(401, 403)) throw error }
+        }
+        require("discovery_pairing" in hello.capabilities) { "这台电脑需要更新至 0.5 版本；也可以展开手动连接。" }
+        requestDiscoveryPair(api, hello, name)
+    }
+
+    private fun requestDiscoveryPair(api: RelayApi, hello: Hello, name: String) {
+        val result = api.json("/api/v2/pair/discovery", "POST", JSONObject().put("name", name.trim()).put("peer_id", discoveryId)
+            .put("server_id", hello.serverId), authenticated = false)
+        val verification = result.getString("verification_code")
+        require(verification.matches(Regex("[0-9]{6}"))) { "电脑返回的验证信息不正确。" }
+        store.setPending(PendingPair(api.origin, hello.serverId, hello.name, result.getString("id"), result.getString("claim_token"), result.getLong("expires_at"), verification))
+        store.preferences.edit().putString("last_origin", api.origin).putString("device_name", name.trim()).apply()
+        message("请核对两端显示的验证数字，再在电脑点信任。无需输入连接码。")
+    }
+
     private suspend fun pollPair(pending: PendingPair) {
-        if (pending.expiresAt < System.currentTimeMillis()) { store.setPending(null); message("配对已过期，请重新扫描电脑二维码。"); return }
+        if (pending.expiresAt < System.currentTimeMillis()) { store.setPending(null); message("连接请求已过期，请在附近设备中重新选择电脑。"); return }
+        if (pending.cancelRequested) {
+            withContext(Dispatchers.IO) { cancelPendingPair(pending) }
+            return
+        }
         runCatching {
             withContext(Dispatchers.IO) {
                 val api = RelayApi(pending.origin)
                 api.verifyServer(pending.serverId)
                 val result = api.json("/api/v2/pair/claim", "POST", JSONObject().put("id", pending.id).put("claim_token", pending.claimToken), authenticated = false)
-                if (store.pending.value?.id != pending.id) return@withContext
+                if (store.pending.value?.id != pending.id || store.pending.value?.cancelRequested == true) return@withContext
                 when (result.getString("status")) {
                     "approved" -> {
                         val device = result.getJSONObject("device")
@@ -118,7 +218,31 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         }.onFailure { message(it.message ?: "等待电脑响应，稍后会重试。") }
     }
 
-    fun cancelPairing() = action { store.setPending(null); message("已停止等待，电脑上的请求会自动过期。") }
+    fun cancelPairing() = action {
+        val pending = refreshLock.withLock {
+            store.pending.value?.copy(cancelRequested = true)?.also(store::setPending)
+        } ?: return@action
+        cancelPendingPair(pending)
+    }
+    fun continuePairing() = action {
+        refreshLock.withLock { store.pending.value?.copy(cancelRequested = false)?.let(store::setPending) }
+        message("正在读取电脑的连接结果。")
+    }
+    private fun cancelPendingPair(pending: PendingPair) {
+        try {
+            val api = RelayApi(pending.origin)
+            api.verifyServer(pending.serverId)
+            val result = api.json("/api/v2/pair/cancel", "POST", JSONObject().put("id", pending.id).put("claim_token", pending.claimToken), authenticated = false)
+            require(result.getString("status") in setOf("rejected", "expired")) { "电脑仍在处理此请求，请稍后再试。" }
+        } catch (error: Exception) {
+            if (!(error is ApiFailure && error.status == 404 && pending.verificationCode.isBlank())) {
+                message(if (error is ApiFailure && error.code == "PAIR_ALREADY_APPROVED") "电脑已批准，但手机不会自动连接。可选择继续连接，或在电脑撤销这台设备。" else "暂时无法确认取消。已停止自动连接，电脑恢复在线后会重试取消。")
+                return
+            }
+        }
+        if (store.pending.value?.id == pending.id) store.setPending(null)
+        message("已取消连接请求，可以重新选择设备。")
+    }
     fun disconnect() = action {
         store.pauseAll("已断开连接，任务保留。")
         activateSession(null)
@@ -206,7 +330,12 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
 
     fun enqueueFiles(uris: List<Uri>, project: String, replaceId: String?, started: () -> Unit) = action {
         require(uris.size <= 100) { "单次最多添加 100 个文件。" }
-        refreshLock.withLock { uris.forEach { store.selectFile(it, project, replaceId = replaceId) } }
+        refreshLock.withLock {
+            if (replaceId != null) {
+                require(uris.size == 1)
+                store.selectFile(uris.single(), project, replaceId = replaceId)
+            } else store.addAll(uris.map { store.prepareFile(it, project) })
+        }
         withContext(Dispatchers.Main) { started() }
     }
     fun enqueueDownload(item: FeedItem, started: () -> Unit) = action {
@@ -214,6 +343,10 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
         val export = item.kind == "feedback"
         refreshLock.withLock {
             requireFeed(session, listOf(item.id))
+            if (store.tasks.value.any { it.itemId == item.id && it.serverId == session.serverId && it.deviceId == session.deviceId && !it.terminal }) {
+                message("这个文件已在传输列表中，可查看进度或继续传输。")
+                return@withLock
+            }
             store.add(TransferTask(direction = if (export) "export" else "download", origin = session.origin, serverId = session.serverId,
                 deviceId = session.deviceId, name = if (export) "feedback-${item.id.take(16)}.md" else item.name,
                 mime = if (export) "text/markdown" else item.mime, size = if (export) -1 else item.size,
@@ -224,10 +357,13 @@ class RelayViewModel(application: Application) : AndroidViewModel(application) {
     fun resume(task: TransferTask, started: () -> Unit) = action {
         val session = store.session.value ?: throw IllegalStateException("请先连接原电脑。")
         TransferRules.validateIdentity(task, session)
-        store.update(task.id) { it.copy(status = "queued", error = "") }
-        withContext(Dispatchers.Main) { started() }
+        var resumed = false
+        store.update(task.id) { current ->
+            TransferRules.resume(current, session).also { resumed = it.status == "queued" && current.status != "queued" }
+        }
+        if (resumed) withContext(Dispatchers.Main) { started() }
     }
-    fun pause(task: TransferTask) = action { store.update(task.id) { it.copy(status = "paused", error = "已暂停，已确认的进度保留。") } }
+    fun pause(task: TransferTask) = action { store.update(task.id) { if (it.terminal) it else it.copy(status = "paused", error = "已暂停，已确认的进度保留。") } }
     fun cancel(task: TransferTask) = action {
         store.update(task.id) { if (it.status == "complete") it else TransferRules.markCancelled(it) }
         val current = store.task(task.id) ?: return@action

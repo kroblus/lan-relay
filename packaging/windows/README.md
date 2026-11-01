@@ -8,7 +8,7 @@ cargo build --locked --release -p relay-desktop -p relay-server -p relay-migrate
 ./packaging/windows/Build.ps1 -SkipBuild
 ```
 
-The script creates a portable ZIP under `output/dist/windows/`. When Inno Setup 6.3 或更新版本
+The script creates a portable ZIP under `output/dist/v0.5.0/windows/`. When Inno Setup 6.3 或更新版本
 is installed it also creates a per-user installer with a desktop shortcut. The
 installer requires no administrator account. Installation does not change the
 firewall or add automatic startup. Runtime data remains in
@@ -35,7 +35,10 @@ explicit manual acceptance items until evidence is recorded.
 Windows GUI subsystem. The test writes the same JSON report inside its isolated
 data directory; errors return a nonzero exit code without a blocking dialog.
 
-The desktop uses Iced 0.14's native rendering with a software rendering backend.
+The desktop uses Iced 0.14 native rendering, preferring WGPU and retaining tiny-skia software fallback.
+Discovery uses UDP 4319 and file traffic uses TCP 4318 by default. Allow this
+application on the trusted Private network in the normal Windows firewall prompt.
+Do not disable the firewall or permit Public networks just to make discovery work.
 Windows tray handles live on a dedicated Windows message-loop thread. When tray
 creation fails the main window displays that condition and closing it exits the
 server, preventing an inaccessible background process.

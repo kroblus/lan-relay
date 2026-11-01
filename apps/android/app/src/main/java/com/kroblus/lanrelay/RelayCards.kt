@@ -1,6 +1,9 @@
 package com.kroblus.lanrelay
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -21,7 +24,8 @@ import java.util.UUID
 import kotlinx.coroutines.delay
 
 @Composable
-internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, onDownload: () -> Unit, onFeedback: () -> Unit, onStatus: () -> Unit) {
+internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, onDownload: () -> Unit, onFeedback: () -> Unit, onStatus: () -> Unit,
+    saved: TransferTask? = null, onOpen: () -> Unit = {}) {
     var details by rememberSaveable(item.id) { mutableStateOf(false) }
     var expanded by rememberSaveable(item.id) { mutableStateOf(false) }
     val glyph = when {
@@ -48,10 +52,8 @@ internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, o
                 RelayIcon(RelayGlyph.More, Modifier.size(20.dp), RelayColors.Muted)
             }
         }
-        if (item.project.isNotBlank() || item.isApk) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (item.project.isNotBlank()) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             if (item.project.isNotBlank()) SuggestionChip(onClick = { details = !details }, label = { Text(item.project, maxLines = 1, overflow = TextOverflow.Ellipsis) })
-            if (item.isApk) SuggestionChip(onClick = onStatus, enabled = !busy, label = { Text(testStatusShort(item.testStatus)) },
-                colors = SuggestionChipDefaults.suggestionChipColors(containerColor = RelayColors.SageLight, labelColor = RelayColors.Sage), border = null)
         }
         if (item.text.isNotEmpty()) {
             SelectionContainer {
@@ -62,16 +64,16 @@ internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, o
         }
         if (item.isApk && item.apkVersion.isNotBlank()) Text("版本 ${item.apkVersion}", style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (item.kind == "file" || item.kind == "feedback") FilledTonalButton(onClick = onDownload, enabled = !busy,
+            if (item.kind == "file" || item.kind == "feedback") FilledTonalButton(onClick = if (saved == null) onDownload else onOpen, enabled = !busy,
                 colors = ButtonDefaults.filledTonalButtonColors(containerColor = RelayColors.SageLight, contentColor = RelayColors.Sage)) {
-                RelayIcon(RelayGlyph.Down, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(if (item.kind == "feedback") "导出反馈" else "保存到手机")
+                RelayIcon(if (saved == null) RelayGlyph.Down else RelayGlyph.Check, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(if (saved != null) FileOpenPolicy.openLabel(saved) else if (item.kind == "feedback") "导出反馈" else "保存到手机")
             }
             if (item.text.isNotEmpty()) TextButton(onClick = { onCopy(item.text) }) {
                 RelayIcon(RelayGlyph.Copy, Modifier.size(17.dp)); Spacer(Modifier.width(6.dp)); Text("复制")
             }
-            if (item.isApk) TextButton(onClick = onFeedback, enabled = !busy) { Text("写反馈") }
         }
-        if (details) {
+        AnimatedVisibility(details) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             HorizontalDivider(color = RelayColors.Line)
             Text("内容详情", style = MaterialTheme.typography.titleSmall)
             SelectionContainer {
@@ -85,9 +87,12 @@ internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, o
             }
             if (item.sha256.isNotBlank()) TextButton(onClick = { onCopy(item.sha256) }) { Text("复制校验值") }
             if (item.isApk) {
-                Text("下载成功不代表已安装或测试通过。", style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
-                TextButton(onClick = onStatus, enabled = !busy) { Text("记录安装 / 测试状态") }
+                Text("开发者记录 · ${testStatusShort(item.testStatus)}", style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
+                TextButton(onClick = onFeedback, enabled = !busy) { Text("写测试反馈") }
+                TextButton(onClick = onStatus, enabled = !busy) { Text("记录测试结果（可选）") }
             }
+            if (saved != null) TextButton(onClick = onDownload, enabled = !busy) { Text("重新保存一份") }
+        }
         }
     }
 }
@@ -96,6 +101,8 @@ internal fun FeedCard(item: FeedItem, busy: Boolean, onCopy: (String) -> Unit, o
 internal fun TransferCard(task: TransferTask, metric: TransferMetrics?, busy: Boolean, onResume: () -> Unit, onPause: () -> Unit, onCancel: () -> Unit, onReselect: () -> Unit, onOpen: () -> Unit) {
     val completed = task.status == "complete"
     val moving = task.status == "uploading" || task.status == "downloading"
+    val progress by animateFloatAsState(if (task.size > 0) (task.offset.toDouble() / task.size).toFloat().coerceIn(0f, 1f) else 0f,
+        animationSpec = tween(160), label = "confirmed-transfer-progress")
     val phaseStarted = remember(task.id, task.status) { elapsedMillis() }
     var sampleTime by remember { mutableLongStateOf(elapsedMillis()) }
     // Only the visible network task runs this 1 Hz clock; no background/global animation.
@@ -127,7 +134,7 @@ internal fun TransferCard(task: TransferTask, metric: TransferMetrics?, busy: Bo
             if (task.status == "hashing" || task.status == "verifying" || task.status == "saving")
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(5.dp), trackColor = RelayColors.SageLight)
             else if (task.size > 0) LinearProgressIndicator(
-                progress = { (task.offset.toFloat() / task.size.toFloat()).coerceIn(0f, 1f) },
+                progress = { progress },
                 modifier = Modifier.fillMaxWidth().height(5.dp), trackColor = RelayColors.SageLight)
         }
         if (moving) {
@@ -152,7 +159,7 @@ internal fun TransferCard(task: TransferTask, metric: TransferMetrics?, busy: Bo
             if (task.status == "needs_file") FilledTonalButton(onClick = onReselect, enabled = !busy) { Text("重选原文件") }
             TextButton(onClick = onCancel, enabled = !busy) { Text("取消") }
         }
-        else if (completed && task.savedUri.isNotEmpty()) TextButton(onClick = onOpen) { Text("打开已保存文件") }
+        else if (completed && task.savedUri.isNotEmpty()) TextButton(onClick = onOpen) { Text(FileOpenPolicy.openLabel(task)) }
         else if (task.status == "cancelled" && task.cancelPending) TextButton(onClick = onCancel, enabled = !busy) { Text("重试电脑端取消") }
     }
 }

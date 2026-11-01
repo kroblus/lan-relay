@@ -62,6 +62,10 @@ pub struct PairRequest {
     pub status: String,
     pub created_at: i64,
     pub expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,6 +73,8 @@ pub struct PairTicket {
     pub id: String,
     pub claim_token: String,
     pub expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +93,15 @@ pub struct NewPairRequest {
     pub code: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+}
+
+/// Discovery is only an address hint. This request creates no device or session
+/// until the owner explicitly approves its matching verification display.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewDiscoveryPairRequest {
+    pub name: String,
+    pub peer_id: String,
+    pub server_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

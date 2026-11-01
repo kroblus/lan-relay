@@ -107,6 +107,12 @@ class RelayStore(private val context: Context) {
     @Synchronized fun update(id: String, transform: (TransferTask) -> TransferTask) {
         commitTasks(_tasks.value.map { if (it.id == id) transform(it) else it })
     }
+    @Synchronized fun finishSavedDownload(id: String, uri: String, size: Long, sha256: String): Boolean {
+        val current = task(id) ?: return false
+        val completed = TransferRules.savedDownload(current, uri, size, sha256)
+        commitTasks(_tasks.value.map { if (it.id == id) completed else it })
+        return true
+    }
     @Synchronized fun updateProgress(id: String, transform: (TransferTask) -> TransferTask) {
         val old = task(id) ?: return
         val next = transform(old)
@@ -123,8 +129,15 @@ class RelayStore(private val context: Context) {
         _metrics.value = if (metrics == null) _metrics.value - id else _metrics.value + (id to metrics)
     }
     @Synchronized fun add(task: TransferTask) {
-        require(_tasks.value.size < 500) { "任务记录已达 500 条，请先清理已完成记录。" }
-        commitTasks(_tasks.value + task)
+        addAll(listOf(task))
+    }
+    @Synchronized fun addAll(tasks: List<TransferTask>) {
+        require(tasks.map { it.id }.distinct().size == tasks.size) { "文件选择中存在重复任务。" }
+        val known = _tasks.value.associateBy { it.id }
+        tasks.forEach { incoming -> known[incoming.id]?.let { require(DraftTaskIdentity.sameSource(it, incoming)) { "这个发送请求的原文件或目标已改变，请重新选择。" } } }
+        val additions = tasks.filter { it.id !in known }
+        require(_tasks.value.size + additions.size <= 500) { "任务记录已达 500 条，请先清理已完成记录。" }
+        if (additions.isNotEmpty()) commitTasks(_tasks.value + additions)
     }
     @Synchronized fun pauseAll(reason: String = "已暂停，点继续恢复。") {
         commitTasks(_tasks.value.map { if (it.active || it.status == "queued") it.copy(status = "paused", error = reason) else it })
@@ -145,6 +158,11 @@ class RelayStore(private val context: Context) {
     }
 
     fun selectFile(uri: Uri, project: String, buildId: String = "", replaceId: String? = null): TransferTask {
+        val task = prepareFile(uri, project, buildId, replaceId)
+        if (replaceId == null) add(task) else update(task.id) { task }
+        return task
+    }
+    fun prepareFile(uri: Uri, project: String, buildId: String = "", replaceId: String? = null): TransferTask {
         require(uri.scheme == "content") { "请选择系统文件选择器提供的文件。" }
         val current = session.value ?: throw IllegalStateException("请先连接电脑。")
         var name = "file"
@@ -166,9 +184,8 @@ class RelayStore(private val context: Context) {
             if (size >= 0 && old.size >= 0) require(size == old.size) { "文件大小不同，请选择原始文件。" }
             old.copy(uri = uri.toString(), persistedUri = persisted, status = "queued", error = "")
         } else TransferTask(direction = "upload", origin = current.origin, serverId = current.serverId, deviceId = current.deviceId,
-            uri = uri.toString(), name = TransferRules.safeName(name), mime = context.contentResolver.getType(uri) ?: "application/octet-stream",
+            uri = uri.toString(), name = TransferRules.safeName(name), mime = FileOpenPolicy.mime(name, context.contentResolver.getType(uri).orEmpty()),
             size = size, project = project.take(120), buildId = buildId, persistedUri = persisted)
-        if (replaceId == null) add(task) else update(task.id) { task }
         return task
     }
 }

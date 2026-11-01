@@ -1,5 +1,10 @@
 package com.kroblus.lanrelay
 
+import android.net.Uri
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -7,6 +12,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -16,7 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
@@ -30,6 +39,9 @@ internal fun RelayScreen(
     model: RelayViewModel,
     onConnect: (String, String, String) -> Unit,
     onScan: () -> Unit,
+    onDiscover: () -> Unit,
+    onDiscovered: (NearbyDesktop, String) -> Unit,
+    onRequireNetwork: (() -> Unit) -> Unit,
     onPick: (String, String?) -> Unit,
     onStartTransfers: () -> Unit,
     onCopy: (String) -> Unit,
@@ -48,10 +60,18 @@ internal fun RelayScreen(
     val incoming by model.incomingAddress.collectAsStateWithLifecycle()
     val sharedFiles by model.sharedFiles.collectAsStateWithLifecycle()
     val sharedText by model.sharedText.collectAsStateWithLifecycle()
+    val stagedNames by model.stagedNames.collectAsStateWithLifecycle()
+    val nearby by model.discovery.peers.collectAsStateWithLifecycle()
+    val discoveryActive by model.discovery.active.collectAsStateWithLifecycle()
+    val discoveryError by model.discovery.error.collectAsStateWithLifecycle()
+    val discoveryInvitation by model.discovery.invitation.collectAsStateWithLifecycle()
+    val contentListState = rememberLazyListState()
+    val deviceListState = rememberLazyListState()
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
     var tab by rememberSaveable { mutableIntStateOf(if (session == null) 2 else 0) }
     var project by rememberSaveable { mutableStateOf(model.store.preferences.getString("project", "").orEmpty()) }
     var text by rememberSaveable { mutableStateOf("") }
-    var composer by rememberSaveable { mutableStateOf(false) }
     var address by rememberSaveable { mutableStateOf(model.store.preferences.getString("last_origin", "").orEmpty()) }
     var name by rememberSaveable { mutableStateOf(model.store.preferences.getString("device_name", "我的手机").orEmpty()) }
     var code by rememberSaveable { mutableStateOf("") }
@@ -68,9 +88,9 @@ internal fun RelayScreen(
         (when (filter) { 1 -> it.kind == "file"; 2 -> it.kind == "text"; 3 -> it.isApk || it.kind == "feedback"; else -> true }) &&
             (!filterProject || project.isBlank() || it.project == project)
     }
-    val textRequestId = remember(text, project) { UUID.randomUUID().toString() }
+    val textRequestId by rememberSaveable(text, project, sharedFiles, session?.serverId, session?.deviceId) { mutableStateOf(UUID.randomUUID().toString()) }
     LaunchedEffect(sharedText) {
-        if (sharedText.isNotEmpty()) { text = sharedText; composer = true; tab = 0; model.sharedText.value = "" }
+        if (sharedText.isNotEmpty()) { text = sharedText; tab = 0; model.sharedText.value = "" }
     }
     LaunchedEffect(sharedFiles) { if (sharedFiles.isNotEmpty()) tab = 0 }
     LaunchedEffect(incoming) {
@@ -88,43 +108,58 @@ internal fun RelayScreen(
     LaunchedEffect(session?.serverId, session?.deviceId) {
         feedbackBuild = null
         statusItem = null
-        if (session != null) { tab = 0; invitePayload = ""; model.refreshNow() }
+        if (session != null) {
+            tab = 0
+            invitePayload = ""
+            contentListState.scrollToItem(0)
+            model.refreshNow()
+        }
+    }
+    LaunchedEffect(pending?.id) {
+        if (pending != null) {
+            focusManager.clearFocus()
+            keyboard?.hide()
+            tab = 2
+            // The request can originate far below this card in the fallback form.
+            // Reveal the actual verification digits, not merely a banner above it.
+            val verificationIndex = if (session == null) 1 else 2
+            if (coroutineContext[MotionDurationScale]?.scaleFactor == 0f) deviceListState.scrollToItem(verificationIndex)
+            else deviceListState.animateScrollToItem(verificationIndex)
+        }
     }
     LaunchedEffect(project) { model.store.preferences.edit().putString("project", project).apply() }
     LaunchedEffect(name) { model.store.preferences.edit().putString("device_name", name).apply() }
     Surface(Modifier.fillMaxSize().safeDrawingPadding().imePadding(), color = RelayColors.Background) {
         Column(Modifier.fillMaxSize()) {
             RelayHeader(session, online, pending != null, onDevices = { tab = 2 })
-            if (notice.isNotEmpty()) NoticeCard(notice, onDismiss = { model.message("") })
+            AnimatedVisibility(notice.isNotEmpty(), enter = fadeIn(tween(140)), exit = fadeOut(tween(100))) {
+                NoticeCard(notice, onDismiss = { model.message("") })
+            }
             when (tab) {
                 0 -> LazyColumn(
                     Modifier.weight(1f).fillMaxWidth(),
+                    state = contentListState,
                     contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     item {
-                        SendHero(
-                            connected = session != null, busy = busy, project = project,
-                            onFiles = { if (session == null) tab = 2 else onPick(project, null) },
-                            onText = { composer = !composer }, onProject = { projectDialog = true }
-                        )
-                    }
-                    if (sharedFiles.isNotEmpty()) item {
-                        RelayCard(tone = RelayColors.Apricot) {
-                            Text("${sharedFiles.size} 个文件，准备发送", style = MaterialTheme.typography.titleMedium)
-                            Text("发送到 ${session?.serverName ?: "电脑 · 请先连接"}", color = RelayColors.Muted)
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(enabled = session != null && !busy, onClick = {
-                                    model.enqueueFiles(sharedFiles, project, null) { model.sharedFiles.value = emptyList(); tab = 1; onStartTransfers() }
-                                }) { Text("确认发送") }
-                                TextButton(onClick = { model.sharedFiles.value = emptyList() }) { Text("取消") }
+                        SendComposer(
+                            target = session?.serverName, busy = busy, project = project, text = text,
+                            files = sharedFiles, names = stagedNames,
+                            onFiles = { onPick(project, null) }, onText = { text = it.take(65536) },
+                            onProject = { projectDialog = true }, onRemove = { uri -> model.sharedFiles.value = sharedFiles - uri },
+                            onSend = {
+                                val target = session
+                                if (target == null) tab = 2 else {
+                                    val body = text
+                                    val attachments = sharedFiles
+                                    val label = project
+                                    val draftId = textRequestId
+                                    onRequireNetwork { model.sendDraft(body, label, draftId, attachments, target,
+                                        done = { if (text == body) text = "" }, started = onStartTransfers) }
+                                }
                             }
-                        }
-                    }
-                    if (composer) item {
-                        TextComposer(text, busy, session != null, onText = { text = it.take(65536) },
-                            onClose = { composer = false },
-                            onSend = { model.sendText(text, project, textRequestId) { text = ""; composer = false } })
+                        )
                     }
                     item {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -145,16 +180,18 @@ internal fun RelayScreen(
                         }
                     }
                     if (session == null) item {
-                        EmptyCard(RelayGlyph.Devices, "连接后，内容就在这里", "让手机与电脑加入同一个局域网，扫描电脑上的二维码即可开始。",
+                        EmptyCard(RelayGlyph.Devices, "连接后，内容就在这里", "让手机与电脑加入同一个局域网，在附近设备中选择电脑即可开始。",
                             action = "连接电脑", onAction = { tab = 2 })
                     } else if (visibleFeed.isEmpty()) item {
                         EmptyCard(RelayGlyph.Folder, if (feed.isEmpty()) "传一份喜欢的内容吧" else "这里还没有内容",
                             if (feed.isEmpty()) "电脑发来的文件、图片和文字，会安静地收在这里。" else "试试其他分类，或刷新最近内容。")
                     }
                     items(visibleFeed, key = { it.id }) { item ->
+                        val saved = tasks.lastOrNull { it.itemId == item.id && it.status == "complete" && it.savedUri.isNotBlank() && it.serverId == session?.serverId && it.deviceId == session?.deviceId }
                         FeedCard(item, busy, onCopy,
                             onDownload = { model.enqueueDownload(item) { tab = 1; onStartTransfers() } },
-                            onFeedback = { feedbackBuild = item }, onStatus = { statusItem = item })
+                            onFeedback = { feedbackBuild = item }, onStatus = { statusItem = item },
+                            saved = saved, onOpen = { if (saved != null) onOpen(saved) })
                     }
                     if (more) item {
                         TextButton(modifier = Modifier.fillMaxWidth(), enabled = !busy, onClick = model::loadMore) { Text("查看更早内容") }
@@ -187,6 +224,7 @@ internal fun RelayScreen(
                 }
                 2 -> LazyColumn(
                     Modifier.weight(1f).fillMaxWidth(),
+                    state = deviceListState,
                     contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
@@ -215,22 +253,40 @@ internal fun RelayScreen(
                         RelayCard(tone = RelayColors.Lavender) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = RelayColors.LilacInk)
-                                Text("等待电脑点一下批准", style = MaterialTheme.typography.titleMedium)
+                                Text(if (pending!!.cancelRequested) "已停止自动连接" else "等待电脑点一下批准", style = MaterialTheme.typography.titleMedium)
                             }
                             Text("${pending!!.serverName}\n${pending!!.origin}", style = MaterialTheme.typography.bodyMedium)
-                            TextButton(onClick = model::cancelPairing) { Text("停止等待") }
+                            if (pending!!.verificationCode.isNotBlank()) {
+                                Text(pending!!.verificationCode.chunked(3).joinToString(" "), style = MaterialTheme.typography.headlineMedium, color = RelayColors.Sage)
+                                Text("只需核对两端数字相同，再在电脑点信任；不用手动输入。", style = MaterialTheme.typography.bodyMedium)
+                            }
+                            TextButton(onClick = model::cancelPairing, enabled = !busy) { Text(if (pending!!.cancelRequested) "重试取消" else "取消连接") }
+                            if (pending!!.cancelRequested) TextButton(onClick = model::continuePairing, enabled = !busy) { Text("继续连接") }
                         }
-                    } else item {
+                    }
+                    item {
                         RelayCard(tone = RelayColors.SageLight) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                                Surface(shape = RoundedCornerShape(18.dp), color = Color.White) { RelayIcon(RelayGlyph.Scan, Modifier.padding(15.dp).size(38.dp), RelayColors.Sage) }
-                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(if (session == null) "扫一扫，就连上" else "连接另一台电脑", style = MaterialTheme.typography.titleLarge)
-                                    Text("打开电脑端「随手传」，找到配对二维码。", style = MaterialTheme.typography.bodyMedium, color = RelayColors.Muted)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("附近设备", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+                                TextButton(onClick = onDiscover, enabled = !busy) { Text(if (discoveryActive) "刷新" else "开始发现") }
+                            }
+                            Text(if (discoveryActive) "正在寻找同一局域网的电脑。电脑端也能看到这台手机。" else "开启发现后，两端会自动出现在附近设备中。",
+                                style = MaterialTheme.typography.bodyMedium, color = RelayColors.Muted)
+                            if (discoveryError.isNotEmpty()) Text(discoveryError, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                            if (nearby.isEmpty()) Text("尚未发现电脑。请打开电脑端随手传，并确认连接同一 Wi-Fi。", style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
+                        }
+                    }
+                    items(nearby, key = { "nearby-" + it.id }) { peer ->
+                        RelayCard {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                IconTile(RelayGlyph.Devices, RelayColors.Lavender, RelayColors.LilacInk, small = true)
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Text(peer.name, style = MaterialTheme.typography.titleMedium)
+                                    Text(peer.origin, style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
                                 }
                             }
-                            Button(onClick = onScan, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), enabled = !busy) {
-                                RelayIcon(RelayGlyph.Scan, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("扫描电脑二维码")
+                            Button(onClick = { onDiscovered(peer, name) }, enabled = !busy && pending == null && session?.serverId != peer.id) {
+                                Text(if (session?.serverId == peer.id) "已连接" else if (connections.any { it.serverId == peer.id }) "连接" else "连接并验证")
                             }
                         }
                     }
@@ -254,14 +310,15 @@ internal fun RelayScreen(
                             }
                             HorizontalDivider(color = RelayColors.Line)
                             TextButton(onClick = { manual = !manual; if (manual) invitePayload = "" }, modifier = Modifier.fillMaxWidth()) {
-                                Text(if (manual) "收起手动连接" else "无法扫码？手动连接")
+                                Text(if (manual) "收起备用连接" else "找不到设备？备用连接")
                             }
                             if (manual) {
+                                TextButton(onClick = onScan, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("扫描电脑二维码") }
                                 OutlinedTextField(value = address, onValueChange = { address = it; invitePayload = "" }, label = { Text("电脑地址") },
                                     placeholder = { Text("192.168.1.10:4318") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
                                 OutlinedTextField(value = code, onValueChange = { code = it.filter { c -> c in '0'..'9' }.take(6) },
-                                    label = { Text("六位连接码") }, supportingText = { Text("已配对的电脑可留空") },
+                                    label = { Text("旧版连接码（可选）") }, supportingText = { Text("0.5 及更新版本无需填写") },
                                     singleLine = true, modifier = Modifier.fillMaxWidth(),
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword))
                                 Button(enabled = !busy && pending == null && address.isNotBlank() && name.isNotBlank(),
@@ -310,6 +367,17 @@ internal fun RelayScreen(
             }
         }
     }
+    discoveryInvitation?.let { peer ->
+        AlertDialog(onDismissRequest = { model.discovery.invitation.value = null },
+            title = { Text("${peer.name} 希望连接") },
+            text = { Text("电脑地址：${peer.origin}\n\n继续后，请核对两端显示的数字，再在电脑上确认信任。") },
+            confirmButton = { Button(enabled = !busy && pending == null, onClick = {
+                model.discovery.invitation.value = null
+                onDiscovered(peer, name)
+                tab = 2
+            }) { Text("继续验证") } },
+            dismissButton = { TextButton(onClick = { model.discovery.invitation.value = null }) { Text("暂不连接") } })
+    }
     if (projectDialog) SimpleValueDialog("给内容加个项目标签", "项目名称（可选）", project, 120,
         description = "以后发送的内容会自动带上这个标签，方便在电脑与手机上归档。留空即可关闭。",
         onDismiss = { projectDialog = false }, onSave = { project = it; projectDialog = false })
@@ -355,10 +423,11 @@ internal fun RelayHeader(session: Session?, online: Boolean, pending: Boolean, o
 }
 
 @Composable
-private fun SendHero(connected: Boolean, busy: Boolean, project: String, onFiles: () -> Unit, onText: () -> Unit, onProject: () -> Unit) {
+private fun SendComposer(target: String?, busy: Boolean, project: String, text: String, files: List<Uri>, names: Map<String, String>,
+    onFiles: () -> Unit, onText: (String) -> Unit, onProject: () -> Unit, onRemove: (Uri) -> Unit, onSend: () -> Unit) {
     RelayCard {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("手机 · 电脑", style = MaterialTheme.typography.labelMedium, color = RelayColors.Sage, modifier = Modifier.weight(1f))
+            Text(target?.let { "发给 $it" } ?: "准备发送", style = MaterialTheme.typography.labelMedium, color = RelayColors.Sage, modifier = Modifier.weight(1f), maxLines = 2)
             Surface(onClick = onProject, shape = CircleShape, color = RelayColors.Background) {
                 Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     RelayIcon(RelayGlyph.Folder, Modifier.size(14.dp), RelayColors.Muted)
@@ -366,30 +435,28 @@ private fun SendHero(connected: Boolean, busy: Boolean, project: String, onFiles
                 }
             }
         }
-        Text("好内容，随手就到。", style = MaterialTheme.typography.headlineSmall)
-        Text("原图、APK、文件和文字\n在你的设备之间，自在流动。", style = MaterialTheme.typography.bodyMedium, color = RelayColors.Muted)
-        Button(onClick = onFiles, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp)) {
-            RelayIcon(if (connected) RelayGlyph.Plus else RelayGlyph.Devices, Modifier.size(20.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(if (connected) "选择文件发送" else "先连接电脑")
+        Text("好内容，随手就到。", style = MaterialTheme.typography.titleLarge)
+        OutlinedTextField(value = text, onValueChange = onText, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 6,
+            placeholder = { Text("写段文字、粘贴链接\n也可以添加文件一起发送") }, enabled = !busy)
+        AnimatedVisibility(files.isNotEmpty(), enter = fadeIn(tween(140)), exit = fadeOut(tween(100))) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("已添加 ${files.size} 个文件", style = MaterialTheme.typography.bodySmall, color = RelayColors.Muted)
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(files, key = { it.toString() }) { uri ->
+                        InputChip(selected = false, onClick = { if (!busy) onRemove(uri) }, enabled = !busy,
+                            label = { Text(names[uri.toString()] ?: "文件", maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 170.dp)) },
+                            trailingIcon = { RelayIcon(RelayGlyph.Close, Modifier.size(16.dp)) })
+                    }
+                }
+            }
         }
-        TextButton(onClick = onText, modifier = Modifier.fillMaxWidth()) {
-            RelayIcon(RelayGlyph.Text, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("发一段文字或链接")
-        }
-    }
-}
-
-@Composable
-private fun TextComposer(text: String, busy: Boolean, connected: Boolean, onText: (String) -> Unit, onClose: () -> Unit, onSend: () -> Unit) {
-    RelayCard {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("写点什么", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            IconButton(onClick = onClose, modifier = Modifier.semantics { contentDescription = "收起文字编辑器，保留草稿" }) { RelayIcon(RelayGlyph.Close, Modifier.size(18.dp), RelayColors.Muted) }
-        }
-        OutlinedTextField(value = text, onValueChange = onText, modifier = Modifier.fillMaxWidth(), minLines = 3, maxLines = 8,
-            placeholder = { Text("粘贴文字、链接或日志\n换行与空格都会保留") })
-        Button(onClick = onSend, enabled = connected && text.isNotBlank() && !busy, modifier = Modifier.align(Alignment.End)) {
-            Text(if (busy) "正在发送…" else "发送文字")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onFiles, enabled = !busy, modifier = Modifier.weight(1f)) {
+                RelayIcon(RelayGlyph.Plus, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("添加文件")
+            }
+            Button(onClick = onSend, enabled = !busy && (text.isNotBlank() || files.isNotEmpty()), modifier = Modifier.heightIn(min = 48.dp)) {
+                Text(when { busy -> "发送中…"; target == null -> "连接后发送"; else -> "发送" })
+            }
         }
     }
 }

@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicReference
 
 class ApiFailure(val status: Int, val code: String, message: String) : IOException(message)
 
-class RelayApi(origin: String, private val token: String = "") {
+class RelayApi(origin: String, private val token: String = "", controlTimeoutMillis: Long = 120_000) {
     companion object {
         fun verified(session: Session): RelayApi = RelayApi(session.origin, session.token).also { it.verifyServer(session.serverId) }
     }
@@ -25,7 +25,7 @@ class RelayApi(origin: String, private val token: String = "") {
     private val running = AtomicReference<Call?>(null)
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS).readTimeout(45, TimeUnit.SECONDS).writeTimeout(45, TimeUnit.SECONDS)
-        .callTimeout(2, TimeUnit.MINUTES)
+        .callTimeout(controlTimeoutMillis, TimeUnit.MILLISECONDS)
         .followRedirects(false).followSslRedirects(false)
         .dns(object : Dns {
             override fun lookup(hostname: String): List<InetAddress> {
@@ -48,6 +48,10 @@ class RelayApi(origin: String, private val token: String = "") {
         headers.forEach { (key, value) -> builder.header(key, value) }
         builder.method(method, body)
         val call = client.newCall(builder.build())
+        // A healthy multi-gigabyte download may take much longer than two minutes.
+        // Keep connect/read idle limits and explicit cancellation; only remove the
+        // whole-call deadline for the bounded, authenticated file response stream.
+        if (method == "GET" && path.startsWith("/api/v2/files/")) call.timeout().clearTimeout()
         running.set(call)
         val response = call.execute()
         if (response.code in 300..399) {
@@ -95,8 +99,9 @@ class RelayApi(origin: String, private val token: String = "") {
     fun hello(): Hello = Hello.parse(json("/api/v2/hello", authenticated = false))
     fun verifyServer(expected: String): Hello = hello().also { require(it.serverId == expected) { "这个地址对应的电脑身份已改变，请重新核对后配对。" } }
     fun upload(id: String) = RemoteUpload.parse(json("/api/v2/uploads/${LinkPolicy.id(id)}"))
-    fun sendChunk(id: String, offset: Long, bytes: ByteArray, count: Int): RemoteUpload {
-        val body = bytes.toRequestBody("application/octet-stream".toMediaType(), 0, count)
+    fun sendChunk(id: String, offset: Long, bytes: ByteArray, count: Int, onProgress: ((Long) -> Unit)? = null): RemoteUpload {
+        val type = "application/octet-stream".toMediaType()
+        val body = if (onProgress == null) bytes.toRequestBody(type, 0, count) else UploadProgressBody(bytes, count, type, onProgress)
         return execute("/api/v2/uploads/${LinkPolicy.id(id)}", "PATCH", body, mapOf("Upload-Offset" to offset.toString())).use {
             RemoteUpload.parse(parseResponse(it))
         }

@@ -4,14 +4,15 @@ use crate::{
     Host, Signal, SIGNALS,
 };
 use iced::widget::{
-    button, checkbox, column, container, pick_list, progress_bar, qr_code, row, scrollable, text,
-    text_editor, text_input, Space,
+    button, checkbox, column, container, float, lazy, pick_list, progress_bar, qr_code, row,
+    scrollable, text, text_editor, text_input, Space,
 };
 use iced::{
-    alignment, clipboard, event, window, Border, Color, Element, Font, Length, Point, Size,
-    Subscription, Task, Theme,
+    alignment, clipboard, event, keyboard, window, Border, Color, Element, Font, Length, Point,
+    Size, Subscription, Task, Theme, Vector,
 };
 use relay_core::{Invite, Item, ItemPage, NewFeedback, NewText, PatchItem, Snapshot, OWNER_ID};
+use relay_server::discovery::DiscoveredPeer;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt, fs,
@@ -21,17 +22,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+const FEED_PAGE_SIZE: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Feed,
     Devices,
     Transfers,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Composer {
-    Files,
-    Text,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +72,12 @@ pub enum Message {
     History(Result<ItemPage, String>, bool),
     Tick,
     Clock,
+    Scrolled,
+    AnimationFrame(Instant),
+    ReduceMotion(bool),
+    DiscoveryTick,
+    InviteNearby(String),
+    ToggleManualPairing,
     Opened,
     Resized(Size),
     Rescaled,
@@ -82,7 +85,6 @@ pub enum Message {
     CloseRequested(window::Id),
     Dropped(PathBuf),
     Page(Page),
-    Composer(Composer),
     ProjectOptions,
     Project(String),
     Query(String),
@@ -92,6 +94,9 @@ pub enum Message {
     Sent(Result<Item, String>),
     ChooseFiles,
     FilesChosen(Vec<PathBuf>),
+    FilesValidated(Vec<PathBuf>, usize),
+    RemoveDraft(usize),
+    PreferencesSaved(Result<(), String>),
     Imported(Result<Item, String>),
     ToggleQueue,
     RemoveQueued(usize),
@@ -113,6 +118,7 @@ pub enum Message {
     Export(String),
     OpenInbox,
     More,
+    FeedPage(usize),
     Reload,
     Quit,
     Stopped,
@@ -173,12 +179,18 @@ pub struct App {
     history_loading: bool,
     page: Page,
     viewport: Size,
-    composer: Composer,
+    transition_started: Option<Instant>,
+    transition_progress: f32,
+    reduce_motion: bool,
     project_options: bool,
     transfer_samples: HashMap<String, TransferSample>,
     project: String,
     query: String,
     filter: ProjectFilter,
+    filtered_indices: Vec<usize>,
+    project_filters: Vec<ProjectFilter>,
+    feed_page: usize,
+    content_revision: u64,
     editor: text_editor::Content,
     sending: bool,
     pending_operations: usize,
@@ -191,7 +203,12 @@ pub struct App {
     invite: Option<Invite>,
     qr: Option<qr_code::Data>,
     invite_loading: bool,
+    nearby: Vec<DiscoveredPeer>,
+    manual_pairing: bool,
     queue: VecDeque<QueuedFile>,
+    draft_files: Vec<PathBuf>,
+    preferences_saving: bool,
+    preferences_dirty: bool,
     importing: Option<ImportProgress>,
     queue_paused: bool,
     revoke_prompt: Option<String>,
@@ -231,12 +248,18 @@ impl App {
             history_loading: false,
             page: Page::Feed,
             viewport: Size::new(1120.0, 760.0),
-            composer: Composer::Files,
+            transition_started: None,
+            transition_progress: 1.0,
+            reduce_motion: preferences.reduce_motion,
             project_options: false,
             transfer_samples: HashMap::new(),
             project: preferences.project,
             query: String::new(),
             filter: ProjectFilter::All,
+            filtered_indices: vec![],
+            project_filters: vec![ProjectFilter::All, ProjectFilter::Unassigned],
+            feed_page: 0,
+            content_revision: 0,
             editor: text_editor::Content::new(),
             sending: false,
             pending_operations: 0,
@@ -249,7 +272,12 @@ impl App {
             invite: None,
             qr: None,
             invite_loading: false,
+            nearby: vec![],
+            manual_pairing: false,
             queue,
+            draft_files: preferences.draft_files,
+            preferences_saving: false,
+            preferences_dirty: false,
             importing: None,
             queue_paused: true,
             revoke_prompt: None,
@@ -279,6 +307,16 @@ impl App {
             }),
         ];
         if self.window.is_some() && !self.exiting {
+            if self.page == Page::Devices {
+                subscriptions.push(
+                    iced::time::every(Duration::from_secs(5)).map(|_| Message::DiscoveryTick),
+                );
+            }
+            if self.transition_started.is_some() {
+                subscriptions.push(
+                    iced::time::every(Duration::from_millis(16)).map(Message::AnimationFrame),
+                );
+            }
             subscriptions.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::Tick));
             if self
                 .transfer_samples
@@ -300,6 +338,7 @@ impl App {
                     | Message::Sent(_)
                     | Message::Operation(_)
                     | Message::Invited(_)
+                    | Message::PreferencesSaved(_)
                     | Message::Signal(Signal::ImportProgress { .. })
                     | Message::Stopped
             )
@@ -314,6 +353,62 @@ impl App {
             }
             Message::Rescaled => self.fit_window(false),
             Message::Clock => Task::none(),
+            Message::Scrolled => {
+                // Forward scroll changes through the application update so the
+                // software fallback also presents the fresh clipped content.
+                Task::none()
+            }
+            Message::DiscoveryTick => {
+                self.nearby = self
+                    .host
+                    .discovery
+                    .as_ref()
+                    .map(|d| d.peers())
+                    .unwrap_or_default();
+                Task::none()
+            }
+            Message::InviteNearby(peer_id) => {
+                let Some(discovery) = self.host.discovery.clone() else {
+                    return Task::none();
+                };
+                self.pending_operations += 1;
+                Task::perform(
+                    async move {
+                        discovery
+                            .invite(&peer_id)
+                            .await
+                            .map(|_| "已通知手机。请在手机确认，再核对两端的验证数字。".into())
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::Operation,
+                )
+            }
+            Message::ToggleManualPairing => {
+                self.manual_pairing = !self.manual_pairing;
+                if self.manual_pairing && self.invite.is_none() {
+                    Task::done(Message::NewInvite)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::AnimationFrame(now) => {
+                if let Some(started) = self.transition_started {
+                    let progress = now.saturating_duration_since(started).as_secs_f32() / 0.16;
+                    self.transition_progress = 1.0 - (1.0 - progress.min(1.0)).powi(3);
+                    if progress >= 1.0 {
+                        self.transition_started = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::ReduceMotion(value) => {
+                self.reduce_motion = value;
+                if value {
+                    self.transition_started = None;
+                    self.transition_progress = 1.0;
+                }
+                self.save_preferences()
+            }
             Message::WorkArea(area, initial) => {
                 let Some(id) = self.window else {
                     return Task::none();
@@ -403,6 +498,7 @@ impl App {
                             self.items.clear();
                         }
                         self.merge_items(page.items);
+                        self.reindex_items();
                         self.next_cursor = page.next_cursor;
                     }
                     Err(error) => self.fail(error),
@@ -421,16 +517,22 @@ impl App {
                 if self.page != page && !self.error {
                     self.notice.clear();
                 }
+                if self.page != page {
+                    self.begin_transition();
+                }
                 self.page = page;
-                if page == Page::Devices && self.invite.is_none() {
-                    Task::done(Message::NewInvite)
+                let refresh = if page == Page::Devices {
+                    Task::done(Message::DiscoveryTick)
                 } else {
                     Task::none()
-                }
-            }
-            Message::Composer(composer) => {
-                self.composer = composer;
-                Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    iced::widget::operation::snap_to(
+                        "page-scroll",
+                        scrollable::RelativeOffset::START,
+                    ),
+                ])
             }
             Message::ProjectOptions => {
                 self.project_options = !self.project_options;
@@ -445,10 +547,14 @@ impl App {
             }
             Message::Query(query) => {
                 self.query = query;
+                self.feed_page = 0;
+                self.reindex_items();
                 Task::none()
             }
             Message::Filter(filter) => {
                 self.filter = filter;
+                self.feed_page = 0;
+                self.reindex_items();
                 Task::none()
             }
             Message::Editor(action) => {
@@ -458,7 +564,13 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Send => self.send(),
+            Message::Send => {
+                if self.page == Page::Feed {
+                    self.send()
+                } else {
+                    Task::none()
+                }
+            }
             Message::Sent(result) => {
                 self.sending = false;
                 let task = match result {
@@ -495,8 +607,51 @@ impl App {
                 },
                 Message::FilesChosen,
             ),
-            Message::Dropped(path) => self.enqueue(vec![path]),
-            Message::FilesChosen(paths) => self.enqueue(paths),
+            Message::Dropped(path) => self.validate_files(vec![path]),
+            Message::FilesChosen(paths) => self.validate_files(paths),
+            Message::FilesValidated(paths, rejected) => {
+                if self.draft_files.len() + paths.len() > 64 {
+                    self.fail("一次最多添加 64 个文件，请分批发送。");
+                    return Task::none();
+                }
+                for path in paths {
+                    if !self.draft_files.contains(&path) {
+                        self.draft_files.push(path);
+                    }
+                }
+                self.page = Page::Feed;
+                if rejected > 0 {
+                    self.fail("部分项目不是可读取的文件；文件夹请先打包。其余文件已加入待发送区。");
+                } else {
+                    self.inform("文件已放进待发送区。可以附上一段文字，再一起发送。");
+                }
+                self.save_preferences()
+            }
+            Message::RemoveDraft(index) => {
+                if index < self.draft_files.len() {
+                    self.draft_files.remove(index);
+                }
+                self.save_preferences()
+            }
+            Message::PreferencesSaved(result) => {
+                self.preferences_saving = false;
+                if let Err(error) = result {
+                    self.queue_paused = true;
+                    self.preferences_dirty = false;
+                    self.exiting = false;
+                    self.fail(format!(
+                        "无法保存本机队列，请检查磁盘空间和目录权限：{error}"
+                    ));
+                } else if self.preferences_dirty {
+                    self.preferences_dirty = false;
+                    return self.save_preferences();
+                }
+                if self.ready_to_exit() {
+                    self.stop_server()
+                } else {
+                    self.next_import()
+                }
+            }
             Message::Imported(result) => {
                 self.importing = None;
                 match result {
@@ -512,13 +667,13 @@ impl App {
                         ));
                     }
                 }
-                self.save_preferences();
+                let saved = self.save_preferences();
                 if self.ready_to_exit() {
                     self.stop_server()
                 } else if self.exiting {
-                    Task::none()
+                    saved
                 } else {
-                    Task::batch([self.next_import(), self.refresh()])
+                    Task::batch([saved, self.refresh()])
                 }
             }
             Message::ToggleQueue => {
@@ -526,12 +681,17 @@ impl App {
                 if self.queue_paused && self.importing.is_some() {
                     self.inform("当前导入完成后暂停后续文件；手机的网络传输不受影响。");
                 }
-                self.next_import()
+                if self.queue_paused {
+                    Task::none()
+                } else {
+                    self.save_preferences()
+                }
             }
             Message::RemoveQueued(index) => {
+                let mut saved = Task::none();
                 if !(index == 0 && self.importing.is_some()) {
                     let removed = self.queue.remove(index);
-                    self.save_preferences();
+                    saved = self.save_preferences();
                     if let Some(queued) = removed {
                         let upload = self.snapshot.as_ref().and_then(|snapshot| {
                             snapshot.uploads.iter().find(|upload| {
@@ -541,17 +701,19 @@ impl App {
                             })
                         });
                         if let Some(upload) = upload {
-                            return Task::done(Message::CancelUpload(upload.id.clone()));
+                            return Task::batch([
+                                saved,
+                                Task::done(Message::CancelUpload(upload.id.clone())),
+                            ]);
                         }
                     }
                 }
-                Task::none()
+                saved
             }
             Message::Address(address) => {
                 self.selected_address = Some(address);
                 self.rebuild_qr();
-                self.save_preferences();
-                Task::none()
+                self.save_preferences()
             }
             Message::Addresses(result) => {
                 match result {
@@ -669,7 +831,6 @@ impl App {
                 Task::none()
             }
             Message::Build(choice) => {
-                self.composer = Composer::Text;
                 if !self.sending {
                     self.feedback_build = choice;
                     self.attachments.clear();
@@ -729,6 +890,11 @@ impl App {
                 )
             }
             Message::More => self.history(false),
+            Message::FeedPage(page) => {
+                self.feed_page =
+                    page.min(self.filtered_indices.len().saturating_sub(1) / FEED_PAGE_SIZE);
+                iced::widget::operation::snap_to("page-scroll", scrollable::RelativeOffset::START)
+            }
             Message::Reload => Task::batch([self.history(true), self.refresh()]),
             Message::Stopped => iced::exit(),
         }
@@ -769,18 +935,64 @@ impl App {
     }
 
     fn merge_items(&mut self, items: Vec<Item>) {
+        let mut changed = false;
         for item in items {
             if let Some(existing) = self.items.iter_mut().find(|i| i.id == item.id) {
-                *existing = item;
+                if !same_item(existing, &item) {
+                    *existing = item;
+                    changed = true;
+                }
             } else {
                 self.items.push(item);
+                changed = true;
             }
         }
-        self.items.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+        if changed {
+            self.items.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            });
+            self.content_revision = self.content_revision.wrapping_add(1);
+            self.reindex_items();
+        }
+    }
+
+    fn reindex_items(&mut self) {
+        let query = self.query.to_lowercase();
+        self.filtered_indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let matches_project = match &self.filter {
+                    ProjectFilter::All => true,
+                    ProjectFilter::Unassigned => item.project.is_empty(),
+                    ProjectFilter::Named(project) => item.project == *project,
+                };
+                (matches_project
+                    && (query.is_empty()
+                        || [&item.name, &item.text, &item.project, &item.note]
+                            .into_iter()
+                            .any(|value| value.to_lowercase().contains(&query))))
+                .then_some(index)
+            })
+            .collect();
+        let mut projects: Vec<_> = self
+            .items
+            .iter()
+            .filter(|i| !i.project.is_empty())
+            .map(|i| i.project.clone())
+            .collect();
+        projects.sort();
+        projects.dedup();
+        self.project_filters = [ProjectFilter::All, ProjectFilter::Unassigned]
+            .into_iter()
+            .chain(projects.into_iter().map(ProjectFilter::Named))
+            .collect();
+        self.feed_page = self
+            .feed_page
+            .min(self.filtered_indices.len().saturating_sub(1) / FEED_PAGE_SIZE);
     }
 
     fn send(&mut self) -> Task<Message> {
@@ -788,23 +1000,46 @@ impl App {
             return Task::none();
         }
         let value = self.editor.text();
-        if value.trim().is_empty() {
-            self.fail("请先写一段文字或反馈说明。");
+        if value.trim().is_empty() && self.draft_files.is_empty() {
+            self.fail("添加文件，或写点文字，就可以发送。");
             return Task::none();
         }
         if value.len() > 64 * 1024 {
             self.fail("文字超过 64 KiB，请作为文本文件发送。");
             return Task::none();
         }
+        if self.queue.len() + self.draft_files.len() > 64 {
+            self.fail("传输队列最多 64 个文件，请等待部分任务完成后再发送。");
+            return Task::none();
+        }
+        if self.feedback_build.is_some() && value.trim().is_empty() {
+            self.fail("请为这份反馈补充一句说明。");
+            return Task::none();
+        }
+        let added = self.draft_files.len();
+        for path in self.draft_files.drain(..) {
+            self.queue.push_back(QueuedFile {
+                path,
+                project: self.project.trim().to_owned(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+            });
+        }
+        if added > 0 {
+            self.queue_paused = false;
+            self.inform(format!("已开始发送 {added} 个文件，完成后手机即可保存。"));
+        }
+        let saved = self.save_preferences();
+        if value.trim().is_empty() {
+            return saved;
+        }
         self.sending = true;
-        self.save_preferences();
         let request_id = self
             .send_request_id
             .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
             .clone();
         let project = self.project.trim().to_owned();
         let relay = self.host.relay.clone();
-        if let Some(build) = &self.feedback_build {
+        let sent = if let Some(build) = &self.feedback_build {
             let feedback = NewFeedback {
                 build_id: build.id.clone(),
                 text: value,
@@ -836,43 +1071,42 @@ impl App {
                 },
                 Message::Sent,
             )
-        }
+        };
+        Task::batch([saved, sent])
     }
 
-    fn enqueue(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
-        if self.exiting {
+    fn validate_files(&self, paths: Vec<PathBuf>) -> Task<Message> {
+        if paths.is_empty() || self.exiting {
             return Task::none();
         }
-        if self.queue.len() + paths.len() > 64 {
-            self.fail("本机队列最多 64 个文件，请等待部分任务完成。");
-            return Task::none();
-        }
-        let mut added = 0;
-        for path in paths {
-            if path.is_file() && !self.queue.iter().any(|queued| queued.path == path) {
-                self.queue.push_back(QueuedFile {
-                    path,
-                    project: self.project.clone(),
-                    request_id: uuid::Uuid::new_v4().to_string(),
-                });
-                added += 1;
-            } else if path.is_dir() {
-                self.fail("请拖入文件；目录请先打包后发送。");
-            }
-        }
-        if added > 0 {
-            self.queue_paused = false;
-            self.inform(format!("已添加 {added} 个文件，正在导入并校验。"));
-            if !self.save_preferences() {
-                self.queue_paused = true;
-                return Task::none();
-            }
-        }
-        self.next_import()
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut valid = Vec::new();
+                    let mut rejected = 0;
+                    for path in paths {
+                        if path.is_file() {
+                            valid.push(path);
+                        } else {
+                            rejected += 1;
+                        }
+                    }
+                    (valid, rejected)
+                })
+                .await
+                .unwrap_or_else(|_| (Vec::new(), 1))
+            },
+            |(valid, rejected)| Message::FilesValidated(valid, rejected),
+        )
     }
 
     fn next_import(&mut self) -> Task<Message> {
-        if self.importing.is_some() || self.queue_paused || self.exiting {
+        if self.importing.is_some()
+            || self.queue_paused
+            || self.exiting
+            || self.preferences_saving
+            || self.preferences_dirty
+        {
             return Task::none();
         }
         let Some(queued) = self.queue.front().cloned() else {
@@ -1027,7 +1261,10 @@ impl App {
         if self.exiting {
             return Task::none();
         }
-        let waiting = self.importing.is_some() || self.sending || self.pending_operations > 0;
+        let waiting = self.importing.is_some()
+            || self.sending
+            || self.pending_operations > 0
+            || self.preferences_saving;
         let wake = if waiting && self.window.is_none() {
             self.show_window()
         } else {
@@ -1035,17 +1272,22 @@ impl App {
         };
         self.exiting = true;
         self.queue_paused = true;
-        self.save_preferences();
+        let saved = self.save_preferences();
         if waiting {
             self.inform("正在等待当前文件或保存操作结束，再保存任务并退出。后续文件会保留在队列；若有保存对话框，请先完成或取消。");
-            return wake;
+            return Task::batch([wake, saved]);
         }
         self.inform("正在停止服务并保存已确认的传输位置…");
-        self.stop_server()
+        saved
     }
 
     fn ready_to_exit(&self) -> bool {
-        self.exiting && self.importing.is_none() && !self.sending && self.pending_operations == 0
+        self.exiting
+            && self.importing.is_none()
+            && !self.sending
+            && self.pending_operations == 0
+            && !self.preferences_saving
+            && !self.preferences_dirty
     }
 
     fn stop_server(&self) -> Task<Message> {
@@ -1061,21 +1303,33 @@ impl App {
         )
     }
 
-    fn save_preferences(&mut self) -> bool {
+    fn save_preferences(&mut self) -> Task<Message> {
+        if self.preferences_saving {
+            self.preferences_dirty = true;
+            return Task::none();
+        }
         let value = Preferences {
             project: self.project.clone(),
             address: self.selected_address.clone().unwrap_or_default(),
             pending_files: self.queue.iter().cloned().collect(),
+            draft_files: self.draft_files.clone(),
+            reduce_motion: self.reduce_motion,
         };
-        // Small advisory preferences only. Transfer durability belongs to the
-        // core. Failure does not advance or falsely complete any transfer.
-        if let Err(error) = value.save(&self.host.directory) {
-            self.fail(format!(
-                "无法保存本机队列，请检查磁盘空间和目录权限：{error}"
-            ));
-            return false;
+        // Serialize and coalesce writes off the UI thread. Imports wait for the
+        // queue identity to be persisted before touching the source file.
+        self.preferences_saving = true;
+        let directory = self.host.directory.clone();
+        blocking(
+            move || value.save(&directory).map_err(|e| e.to_string()),
+            Message::PreferencesSaved,
+        )
+    }
+
+    fn begin_transition(&mut self) {
+        if !self.reduce_motion {
+            self.transition_started = Some(Instant::now());
+            self.transition_progress = 0.0;
         }
-        true
     }
 
     fn inform(&mut self, message: impl Into<String>) {
@@ -1177,7 +1431,8 @@ impl App {
                 }),
             );
         }
-        main = main.push(page);
+        let offset = (1.0 - self.transition_progress) * 5.0;
+        main = main.push(float(page).translate(move |_, _| Vector::new(0.0, offset)));
         let main = container(main)
             .padding(if compact { 20 } else { 28 })
             .width(Length::Fill)
@@ -1278,16 +1533,12 @@ impl App {
 
     fn feed(&self) -> Element<'_, Message> {
         let mut compose = column![row![
-            container(
-                row![
-                    segment("发送文件", Composer::Files, self.composer),
-                    segment("写段文字", Composer::Text, self.composer),
-                ]
-                .spacing(4)
-            )
-            .padding(4)
-            .style(segment_surface),
-            Space::new().width(Length::Fill),
+            column![
+                text("一起发送").size(20).font(bold_font()),
+                text("拖入文件，顺手写点什么。").size(13).color(MUTED)
+            ]
+            .spacing(6)
+            .width(Length::Fill),
             button(
                 text(if self.project.is_empty() {
                     "＋ 项目".into()
@@ -1301,159 +1552,132 @@ impl App {
             .on_press(Message::ProjectOptions),
         ]
         .spacing(8)
-        .align_y(alignment::Vertical::Center),]
-        .spacing(18);
+        .align_y(alignment::Vertical::Center)]
+        .spacing(14);
         if self.project_options {
             compose = compose.push(
-                row![
-                    text("归入项目").size(13).color(MUTED),
-                    text_input("可选，例如：应用试用、旅行照片", &self.project)
-                        .on_input(Message::Project)
-                        .padding([11, 13])
-                        .size(14)
-                        .style(field_style)
-                        .width(Length::Fill),
-                ]
-                .spacing(12)
-                .align_y(alignment::Vertical::Center),
+                text_input("归入项目（可选）", &self.project)
+                    .on_input(Message::Project)
+                    .padding([11, 13])
+                    .size(14)
+                    .style(field_style),
             );
         }
-        if self.composer == Composer::Files {
-            let picture = container(text("↗").size(42).font(bold_font()).color(SAGE))
-                .center_x(80)
-                .center_y(80)
-                .style(icon_sage_surface);
-            let introduction = column![
-                text("轻轻一拖，随手分享")
-                    .size(24)
-                    .font(bold_font())
-                    .color(INK),
-                text("把原图、APK、录屏或文件放进来。")
-                    .size(14)
-                    .color(MUTED),
-                row![
-                    badge("原始画质", SAGE, SAGE_SOFT),
-                    badge("断点续传", MAUVE, LAVENDER)
-                ]
-                .spacing(8),
-            ]
-            .spacing(10);
-            let choose = button(text("选择文件  ↗").size(15).font(bold_font()))
-                .on_press(Message::ChooseFiles)
-                .padding([13, 20])
-                .style(primary_button);
-            let drop_content: Element<'_, Message> = if self.viewport.width >= 1080.0 {
-                row![picture, introduction.width(Length::Fill), choose]
-                    .spacing(20)
-                    .align_y(alignment::Vertical::Center)
-                    .into()
-            } else {
-                column![
-                    row![picture, introduction.width(Length::Fill)]
-                        .spacing(18)
-                        .align_y(alignment::Vertical::Center),
-                    choose
-                ]
-                .spacing(18)
-                .into()
-            };
+        if let Some(build) = &self.feedback_build {
             compose = compose.push(
-                container(drop_content)
-                    .padding(24)
-                    .width(Length::Fill)
-                    .style(drop_surface),
+                container(
+                    row![
+                        column![
+                            text("构建反馈").size(12).color(MAUVE),
+                            text(&build.label).size(15).font(bold_font())
+                        ]
+                        .spacing(5)
+                        .width(Length::Fill),
+                        button(text("取消关联").size(13))
+                            .on_press(Message::Build(None))
+                            .style(quiet_button)
+                            .padding([9, 12]),
+                    ]
+                    .spacing(12)
+                    .align_y(alignment::Vertical::Center),
+                )
+                .padding(14)
+                .width(Length::Fill)
+                .style(lavender_surface),
             );
-        } else {
-            if let Some(build) = &self.feedback_build {
-                compose = compose.push(
+        }
+        compose = compose.push(
+            text_editor(&self.editor)
+                .placeholder(if self.feedback_build.is_some() {
+                    "写下问题与复现步骤；已有截图、录屏可以在下方勾选关联。"
+                } else {
+                    "写点文字、贴一个链接，或只发送文件…"
+                })
+                .height(if self.viewport.height < 600.0 {
+                    82
+                } else {
+                    106
+                })
+                .padding(14)
+                .size(16)
+                .style(editor_style)
+                .key_binding(editor_key_binding)
+                .on_action(Message::Editor),
+        );
+        if !self.draft_files.is_empty() {
+            let mut files = column![].spacing(6);
+            for (index, path) in self.draft_files.iter().enumerate() {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                files = files.push(
                     container(
                         row![
-                            column![
-                                text("构建反馈").size(12).color(MAUVE),
-                                text(&build.label).size(15).font(bold_font())
-                            ]
-                            .spacing(5)
-                            .width(Length::Fill),
-                            button(text("取消关联").size(13))
-                                .on_press(Message::Build(None))
+                            text("↗").size(16).color(SAGE),
+                            text(name)
+                                .size(13)
+                                .wrapping(text::Wrapping::Glyph)
+                                .width(Length::Fill),
+                            button(text("移除").size(12))
+                                .padding([7, 10])
                                 .style(quiet_button)
-                                .padding([9, 12]),
+                                .on_press(Message::RemoveDraft(index)),
                         ]
-                        .spacing(12)
+                        .spacing(10)
                         .align_y(alignment::Vertical::Center),
                     )
-                    .padding(14)
+                    .padding([5, 10])
                     .width(Length::Fill)
-                    .style(lavender_surface),
+                    .style(inset_surface),
                 );
             }
             compose = compose.push(
-                text_editor(&self.editor)
-                    .placeholder(if self.feedback_build.is_some() {
-                        "写下遇到的问题和复现步骤，再从下方内容里勾选截图、录屏。"
-                    } else {
-                        "有什么想分享的？文字、链接，或一小段代码。"
-                    })
-                    .height(126)
-                    .padding(16)
-                    .size(16)
-                    .style(editor_style)
-                    .on_action(Message::Editor),
-            );
-            let label = if self.sending {
-                "正在发送…"
-            } else if self.feedback_build.is_some() {
-                "发送反馈  ↗"
-            } else {
-                "发送文字  ↗"
-            };
-            let mut send = button(text(label).size(14).font(bold_font()))
-                .padding([12, 18])
-                .style(primary_button);
-            if !self.sending && !self.exiting {
-                send = send.on_press(Message::Send);
-            }
-            compose = compose.push(
-                row![
-                    text(if self.feedback_build.is_some() {
-                        format!("已选 {} 个附件", self.attachments.len())
-                    } else {
-                        "保留换行、缩进与每一个字。".into()
-                    })
-                    .size(13)
-                    .color(MUTED)
-                    .width(Length::Fill),
-                    send,
-                ]
-                .spacing(12)
-                .align_y(alignment::Vertical::Center),
+                scrollable(files)
+                    .height((self.draft_files.len() as f32 * 48.0).min(160.0))
+                    .on_scroll(|_| Message::Scrolled),
             );
         }
-        let query = self.query.to_lowercase();
-        let visible = self.items.iter().filter(|item| {
-            let matches_project = match &self.filter {
-                ProjectFilter::All => true,
-                ProjectFilter::Unassigned => item.project.is_empty(),
-                ProjectFilter::Named(project) => item.project == *project,
-            };
-            matches_project
-                && (query.is_empty()
-                    || format!("{} {} {} {}", item.name, item.text, item.project, item.note)
-                        .to_lowercase()
-                        .contains(&query))
-        });
-        let mut projects: Vec<String> = self
-            .items
-            .iter()
-            .filter(|i| !i.project.is_empty())
-            .map(|i| i.project.clone())
-            .collect();
-        projects.sort();
-        projects.dedup();
-        let filters: Vec<_> = [ProjectFilter::All, ProjectFilter::Unassigned]
-            .into_iter()
-            .chain(projects.into_iter().map(ProjectFilter::Named))
-            .collect();
+        let label = if self.sending {
+            "发送中…".to_owned()
+        } else if self.feedback_build.is_some() {
+            "发送反馈  ↗".into()
+        } else if self.draft_files.is_empty() {
+            "发送  ↗".into()
+        } else {
+            format!("发送 {} 个文件  ↗", self.draft_files.len())
+        };
+        let mut send = button(text(label).size(14).font(bold_font()))
+            .padding([12, 18])
+            .style(primary_button);
+        if !self.sending
+            && !self.exiting
+            && (!self.draft_files.is_empty() || !self.editor.text().trim().is_empty())
+        {
+            send = send.on_press(Message::Send);
+        }
+        compose = compose.push(
+            row![
+                button(text("＋ 添加文件").size(14))
+                    .on_press(Message::ChooseFiles)
+                    .padding([12, 14])
+                    .style(soft_button),
+                Space::new().width(Length::Fill),
+                send,
+            ]
+            .spacing(10)
+            .align_y(alignment::Vertical::Center),
+        );
+        compose = compose.push(
+            text(if self.feedback_build.is_some() {
+                format!("已关联 {} 个反馈附件", self.attachments.len())
+            } else {
+                "拖入文件后点击发送，也可以按 Ctrl + Enter。".into()
+            })
+            .size(12)
+            .color(MUTED),
+        );
         let heading = row![
             text("最近内容").size(20).font(bold_font()),
             badge(format!("{}", self.items.len()), MUTED, SAGE_SOFT),
@@ -1479,11 +1703,15 @@ impl App {
                 .size(14)
                 .style(field_style)
                 .width(Length::Fill),
-            pick_list(filters, Some(self.filter.clone()), Message::Filter)
-                .width(155)
-                .padding([12, 13])
-                .text_size(13)
-                .style(select_style),
+            pick_list(
+                self.project_filters.clone(),
+                Some(self.filter.clone()),
+                Message::Filter
+            )
+            .width(155)
+            .padding([12, 13])
+            .text_size(13)
+            .style(select_style),
         ]
         .spacing(10)
         .align_y(alignment::Vertical::Center);
@@ -1497,9 +1725,31 @@ impl App {
             search
         ]
         .spacing(14);
+        let page_indices = self
+            .filtered_indices
+            .iter()
+            .skip(self.feed_page * FEED_PAGE_SIZE)
+            .take(FEED_PAGE_SIZE);
         let mut count = 0;
-        for item in visible {
-            content = content.push(self.item_card(item));
+        for &index in page_indices {
+            let item = &self.items[index];
+            let sender = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.devices.iter().find(|d| d.id == item.device_id))
+                .map(|d| d.name.clone())
+                .unwrap_or_default();
+            content = content.push(lazy(
+                (
+                    item.id.clone(),
+                    self.content_revision,
+                    self.selected_item.as_deref() == Some(item.id.as_str()),
+                    self.feedback_build.as_ref().map(|b| b.id.clone()),
+                    self.attachments.contains(&item.id),
+                    sender,
+                ),
+                move |_| self.item_card(item),
+            ));
             count += 1;
         }
         if count == 0 {
@@ -1545,6 +1795,34 @@ impl App {
                     .style(card),
             );
         }
+        let pages = self.filtered_indices.len().div_ceil(FEED_PAGE_SIZE);
+        if pages > 1 {
+            let mut previous = button(text("← 上一页").size(13))
+                .padding([10, 14])
+                .style(soft_button);
+            let mut next = button(text("下一页 →").size(13))
+                .padding([10, 14])
+                .style(soft_button);
+            if self.feed_page > 0 {
+                previous = previous.on_press(Message::FeedPage(self.feed_page - 1));
+            }
+            if self.feed_page + 1 < pages {
+                next = next.on_press(Message::FeedPage(self.feed_page + 1));
+            }
+            content = content.push(
+                row![
+                    previous,
+                    Space::new().width(Length::Fill),
+                    text(format!("{} / {}", self.feed_page + 1, pages))
+                        .size(13)
+                        .color(MUTED),
+                    Space::new().width(Length::Fill),
+                    next
+                ]
+                .spacing(12)
+                .align_y(alignment::Vertical::Center),
+            );
+        }
         if self.next_cursor.is_some() {
             let mut more = button(
                 text(if self.history_loading {
@@ -1562,6 +1840,8 @@ impl App {
             content = content.push(container(more).center_x(Length::Fill).padding([8, 0]));
         }
         scrollable(content.padding([0, 3]))
+            .id("page-scroll")
+            .on_scroll(|_| Message::Scrolled)
             .height(Length::Fill)
             .direction(scrollable::Direction::Vertical(
                 scrollable::Scrollbar::new()
@@ -1573,7 +1853,7 @@ impl App {
             .into()
     }
 
-    fn item_card<'a>(&'a self, item: &'a Item) -> Element<'a, Message> {
+    fn item_card(&self, item: &Item) -> Element<'static, Message> {
         let file = item.kind == "file";
         let apk = file && item.name.to_lowercase().ends_with(".apk");
         let (label, tint, soft) = if apk {
@@ -1624,21 +1904,6 @@ impl App {
         .spacing(8);
         if !item.project.is_empty() {
             meta = meta.push(badge(excerpt(&item.project, 20), SAGE, SAGE_SOFT));
-        }
-        if apk {
-            meta = meta.push(badge(
-                test_status(&item.test_status),
-                if item.test_status == "failed" {
-                    RED
-                } else {
-                    MAUVE
-                },
-                if item.test_status == "failed" {
-                    RED_SOFT
-                } else {
-                    LAVENDER
-                },
-            ));
         }
         let mut detail = column![
             text(title)
@@ -1731,7 +1996,7 @@ impl App {
         if expanded {
             let mut extra = column![].spacing(12);
             if !item.text.is_empty() {
-                extra = extra.push(text(&item.text).size(15).line_height(1.6));
+                extra = extra.push(text(item.text.clone()).size(15).line_height(1.6));
             }
             if let Some(metadata) = &item.apk {
                 extra = extra.push(
@@ -1761,10 +2026,10 @@ impl App {
                     .wrapping(text::Wrapping::Glyph),
             );
             if apk {
-                extra = extra.push(text("手动记录你的试用结果").size(14).font(bold_font()));
+                extra = extra.push(text("开发者试用记录（可选）").size(14).font(bold_font()));
                 let mut marks = row![].spacing(7);
                 for (value, label) in [
-                    ("unverified", "待验收"),
+                    ("unverified", "未测试"),
                     ("installed", "已安装"),
                     ("passed", "通过"),
                     ("failed", "失败"),
@@ -1782,7 +2047,7 @@ impl App {
                     );
                 }
                 extra = extra.push(marks.wrap()).push(
-                    text("下载完成不会自动变更安装或测试状态。")
+                    text("正常收发无需填写此项；仅用于你主动记录安装或测试结果。")
                         .size(12)
                         .color(MUTED),
                 );
@@ -1802,139 +2067,227 @@ impl App {
     }
 
     fn devices(&self) -> Element<'_, Message> {
-        let mut pairing = column![
+        let mut nearby = column![
             row![
-                text("连接新设备").size(20).font(bold_font()),
+                text("附近的设备").size(20).font(bold_font()),
                 Space::new().width(Length::Fill),
-                badge("在同一局域网", SAGE, SAGE_SOFT)
+                button(text("刷新列表  ↻").size(13))
+                    .padding([9, 12])
+                    .style(quiet_button)
+                    .on_press(Message::DiscoveryTick)
             ]
+            .spacing(10)
             .align_y(alignment::Vertical::Center),
-            text("打开手机上的随手传，扫描这里的二维码，再由你批准连接。")
+            text("同一局域网中自动发现。打开手机上的随手传，保持 App 在前台。")
                 .size(14)
                 .color(MUTED),
         ]
         .spacing(14);
-        if let Some(invite) = &self.invite {
-            let remaining = (invite.expires_at - unix_millis()).max(0) / 1000;
-            if remaining > 0 {
-                let display_code = invite
-                    .code
-                    .chars()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let mut code = column![
-                    text("也可以输入连接码").size(13).color(MUTED),
-                    text(display_code).size(32).font(bold_font()).color(SAGE),
-                    text(format!("{} 分 {} 秒内有效", remaining / 60, remaining % 60))
-                        .size(12)
-                        .color(MUTED),
-                ]
-                .spacing(12)
-                .width(Length::Fill);
-                if let Some(link) = self.pairing_url() {
-                    code = code.push(
-                        button(text("复制邀请链接  ↗").size(13))
-                            .on_press(Message::Copy(link))
-                            .padding([10, 14])
-                            .style(soft_button),
-                    );
-                }
-                if let Some(qr) = &self.qr {
-                    let qr_view = container(qr_code(qr).cell_size(3)).padding(16).style(card);
-                    let block: Element<'_, Message> = if self.viewport.width < 720.0 {
-                        column![qr_view, code]
-                            .spacing(22)
-                            .align_x(alignment::Horizontal::Center)
-                            .into()
+        if let Some(error) = &self.host.discovery_error {
+            nearby = nearby.push(text(error).size(13).color(RED));
+        } else if self.nearby.is_empty() {
+            nearby = nearby.push(container(column![
+                text("正在等你的设备出现").size(16).font(bold_font()),
+                text("每 5 秒刷新一次。若始终看不到，请确认连接同一 Wi-Fi，并允许局域网访问。").size(13).color(MUTED),
+            ].spacing(8)).padding(20).width(Length::Fill).style(sage_surface));
+        }
+        for peer in &self.nearby {
+            let mut details = column![
+                text(peer.name.clone()).size(16).font(bold_font()),
+                text(format!(
+                    "{} · {}",
+                    if peer.role == "android" {
+                        "Android 手机"
                     } else {
-                        row![qr_view, code]
-                            .spacing(28)
-                            .align_y(alignment::Vertical::Center)
-                            .into()
-                    };
-                    pairing = pairing.push(
-                        container(block)
-                            .padding(20)
-                            .width(Length::Fill)
-                            .style(sage_surface),
-                    );
-                } else {
-                    pairing = pairing.push(code);
-                }
-            } else {
-                pairing = pairing.push(
-                    container(text("这组连接码已过期，换一组就好。").size(14).color(MUTED))
-                        .padding(20)
-                        .width(Length::Fill)
-                        .style(inset_surface),
+                        "另一台电脑"
+                    },
+                    peer.address
+                ))
+                .size(12)
+                .color(MUTED),
+            ]
+            .spacing(6)
+            .width(Length::Fill);
+            if peer.role != "android" {
+                details = details.push(text("可在手机上选择连接这台电脑").size(12).color(MUTED));
+            }
+            let mut line = row![device_symbol(), details]
+                .spacing(14)
+                .align_y(alignment::Vertical::Center);
+            if peer.role == "android" {
+                line = line.push(
+                    button(text("请求连接").size(13))
+                        .padding([10, 14])
+                        .style(primary_button)
+                        .on_press(Message::InviteNearby(peer.peer_id.clone())),
                 );
             }
-        } else {
-            pairing = pairing.push(
-                container(
-                    column![
-                        text("◉").size(34).color(SAGE),
-                        text(if self.invite_loading {
-                            "正在准备连接邀请…"
-                        } else {
-                            "生成邀请，让设备相遇"
-                        })
-                        .size(16)
-                        .font(bold_font()),
-                    ]
-                    .spacing(14)
-                    .align_x(alignment::Horizontal::Center),
-                )
-                .padding(28)
-                .center_x(Length::Fill)
-                .style(sage_surface),
+            nearby = nearby.push(
+                container(line)
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(inset_surface),
             );
         }
-        if self.addresses.is_empty() {
-            pairing = pairing.push(
-                text("连接 Wi-Fi 或网线后，重新生成邀请以发现局域网地址。")
-                    .size(14)
-                    .color(RED),
-            );
-        } else {
-            pairing = pairing.push(text("使用的网络地址").size(12).color(MUTED));
-            pairing = pairing.push(
-                pick_list(
-                    self.addresses.clone(),
-                    self.selected_address.clone(),
-                    Message::Address,
-                )
-                .width(Length::Fill)
-                .padding([12, 14])
-                .text_size(14)
-                .style(select_style),
-            );
-        }
-        let mut renew = button(
-            text(if self.invite_loading {
-                "准备中…"
-            } else {
-                "换一组连接码  ↻"
-            })
-            .size(14),
-        )
-        .padding([12, 18])
-        .style(primary_button);
-        if !self.invite_loading {
-            renew = renew.on_press(Message::NewInvite);
-        }
-        pairing = pairing.push(renew);
-        pairing = pairing.push(
-            text("HTTP 局域网模式未加密，请只在可信网络中使用。")
+        nearby = nearby.push(
+            text("第一次连接核对双方显示的数字即可，无需输入配对码。已信任设备可直接收发。")
                 .size(12)
                 .color(MUTED),
         );
-        let mut content = column![container(pairing)
+        nearby = nearby.push(
+            button(
+                text(if self.manual_pairing {
+                    "收起扫码与手动连接  ↑"
+                } else {
+                    "找不到设备？扫码或手动连接  ↓"
+                })
+                .size(13),
+            )
+            .padding([10, 12])
+            .style(quiet_button)
+            .on_press(Message::ToggleManualPairing),
+        );
+        let mut content = column![container(nearby)
             .padding(24)
             .width(Length::Fill)
             .style(card)]
         .spacing(20);
+        if self.manual_pairing {
+            let mut pairing = column![
+                row![
+                    text("连接新设备").size(20).font(bold_font()),
+                    Space::new().width(Length::Fill),
+                    badge("在同一局域网", SAGE, SAGE_SOFT)
+                ]
+                .align_y(alignment::Vertical::Center),
+                text("打开手机上的随手传，扫描这里的二维码，再由你批准连接。")
+                    .size(14)
+                    .color(MUTED),
+            ]
+            .spacing(14);
+            if let Some(invite) = &self.invite {
+                let remaining = (invite.expires_at - unix_millis()).max(0) / 1000;
+                if remaining > 0 {
+                    let display_code = invite
+                        .code
+                        .chars()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut code = column![
+                        text("也可以输入连接码").size(13).color(MUTED),
+                        text(display_code).size(32).font(bold_font()).color(SAGE),
+                        text(format!("{} 分 {} 秒内有效", remaining / 60, remaining % 60))
+                            .size(12)
+                            .color(MUTED),
+                    ]
+                    .spacing(12)
+                    .width(Length::Fill);
+                    if let Some(link) = self.pairing_url() {
+                        code = code.push(
+                            button(text("复制邀请链接  ↗").size(13))
+                                .on_press(Message::Copy(link))
+                                .padding([10, 14])
+                                .style(soft_button),
+                        );
+                    }
+                    if let Some(qr) = &self.qr {
+                        let qr_view = container(qr_code(qr).cell_size(3)).padding(16).style(card);
+                        let block: Element<'_, Message> = if self.viewport.width < 720.0 {
+                            column![qr_view, code]
+                                .spacing(22)
+                                .align_x(alignment::Horizontal::Center)
+                                .into()
+                        } else {
+                            row![qr_view, code]
+                                .spacing(28)
+                                .align_y(alignment::Vertical::Center)
+                                .into()
+                        };
+                        pairing = pairing.push(
+                            container(block)
+                                .padding(20)
+                                .width(Length::Fill)
+                                .style(sage_surface),
+                        );
+                    } else {
+                        pairing = pairing.push(code);
+                    }
+                } else {
+                    pairing = pairing.push(
+                        container(text("这组连接码已过期，换一组就好。").size(14).color(MUTED))
+                            .padding(20)
+                            .width(Length::Fill)
+                            .style(inset_surface),
+                    );
+                }
+            } else {
+                pairing = pairing.push(
+                    container(
+                        column![
+                            text("◉").size(34).color(SAGE),
+                            text(if self.invite_loading {
+                                "正在准备连接邀请…"
+                            } else {
+                                "生成邀请，让设备相遇"
+                            })
+                            .size(16)
+                            .font(bold_font()),
+                        ]
+                        .spacing(14)
+                        .align_x(alignment::Horizontal::Center),
+                    )
+                    .padding(28)
+                    .center_x(Length::Fill)
+                    .style(sage_surface),
+                );
+            }
+            if self.addresses.is_empty() {
+                pairing = pairing.push(
+                    text("连接 Wi-Fi 或网线后，重新生成邀请以发现局域网地址。")
+                        .size(14)
+                        .color(RED),
+                );
+            } else {
+                pairing = pairing.push(text("使用的网络地址").size(12).color(MUTED));
+                pairing = pairing.push(
+                    pick_list(
+                        self.addresses.clone(),
+                        self.selected_address.clone(),
+                        Message::Address,
+                    )
+                    .width(Length::Fill)
+                    .padding([12, 14])
+                    .text_size(14)
+                    .style(select_style),
+                );
+            }
+            let mut renew = button(
+                text(if self.invite_loading {
+                    "准备中…"
+                } else {
+                    "换一组连接码  ↻"
+                })
+                .size(14),
+            )
+            .padding([12, 18])
+            .style(primary_button);
+            if !self.invite_loading {
+                renew = renew.on_press(Message::NewInvite);
+            }
+            pairing = pairing.push(renew);
+            pairing = pairing.push(
+                text("HTTP 局域网模式未加密，请只在可信网络中使用。")
+                    .size(12)
+                    .color(MUTED),
+            );
+            content = content.push(
+                container(pairing)
+                    .padding(24)
+                    .width(Length::Fill)
+                    .style(card),
+            );
+        }
         if let Some(snapshot) = &self.snapshot {
             let pending: Vec<_> = snapshot
                 .pair_requests
@@ -1949,7 +2302,7 @@ impl App {
                             .on_press(Message::Pair(request.id.clone(), false))
                             .padding([10, 13])
                             .style(quiet_button),
-                        button(text("批准连接").size(13))
+                        button(text("核对并允许").size(13))
                             .on_press(Message::Pair(request.id.clone(), true))
                             .padding([10, 16])
                             .style(primary_button),
@@ -1962,7 +2315,17 @@ impl App {
                                     device_symbol(),
                                     column![
                                         text(&request.name).size(17).font(bold_font()),
-                                        text("新的连接申请").size(12).color(CLAY)
+                                        text(
+                                            request
+                                                .verification_code
+                                                .as_ref()
+                                                .map(|code| format!(
+                                                    "验证数字：{code} · 与手机一致后允许"
+                                                ))
+                                                .unwrap_or_else(|| "新的连接申请".into())
+                                        )
+                                        .size(13)
+                                        .color(CLAY)
                                     ]
                                     .spacing(7)
                                     .width(Length::Fill)
@@ -2058,7 +2421,27 @@ impl App {
                     .color(MUTED),
             );
         }
+        content = content.push(
+            container(
+                column![
+                    text("使用偏好").size(16).font(bold_font()),
+                    checkbox(self.reduce_motion)
+                        .label("减少动效")
+                        .text_size(14)
+                        .on_toggle(Message::ReduceMotion),
+                    text("短暂的页面过渡只在切换时播放，静止时不持续刷新。")
+                        .size(12)
+                        .color(MUTED),
+                ]
+                .spacing(12),
+            )
+            .padding(20)
+            .width(Length::Fill)
+            .style(card),
+        );
         scrollable(content.padding([0, 3]))
+            .id("page-scroll")
+            .on_scroll(|_| Message::Scrolled)
             .height(Length::Fill)
             .direction(scrollable::Direction::Vertical(
                 scrollable::Scrollbar::new()
@@ -2194,7 +2577,7 @@ impl App {
                 let state = if upload.status == "failed" {
                     "需要处理"
                 } else if upload.offset >= upload.size {
-                    "等待校验确认"
+                    "等待自动校验"
                 } else if rate.is_some() {
                     "正在接收"
                 } else if upload.offset == 0 {
@@ -2377,6 +2760,8 @@ impl App {
                 .color(MUTED),
         );
         scrollable(content.padding([0, 3]))
+            .id("page-scroll")
+            .on_scroll(|_| Message::Scrolled)
             .height(Length::Fill)
             .direction(scrollable::Direction::Vertical(
                 scrollable::Scrollbar::new()
@@ -2387,6 +2772,41 @@ impl App {
             .style(scroll_style)
             .into()
     }
+}
+
+fn editor_key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    if matches!(event.status, text_editor::Status::Focused { .. })
+        && event.key == keyboard::Key::Named(keyboard::key::Named::Enter)
+        && event.modifiers.command()
+        && !event.modifiers.alt()
+    {
+        Some(text_editor::Binding::Custom(Message::Send))
+    } else {
+        text_editor::Binding::from_key_press(event)
+    }
+}
+
+fn same_item(a: &Item, b: &Item) -> bool {
+    a.id == b.id
+        && a.kind == b.kind
+        && a.device_id == b.device_id
+        && a.created_at == b.created_at
+        && a.project == b.project
+        && a.text == b.text
+        && a.name == b.name
+        && a.mime == b.mime
+        && a.size == b.size
+        && a.sha256 == b.sha256
+        && a.build_id == b.build_id
+        && a.attachment_ids == b.attachment_ids
+        && a.note == b.note
+        && a.test_status == b.test_status
+        && a.apk
+            .as_ref()
+            .map(|m| (&m.status, &m.package_name, &m.version_name, &m.version_code))
+            == b.apk
+                .as_ref()
+                .map(|m| (&m.status, &m.package_name, &m.version_name, &m.version_code))
 }
 
 fn signal_stream() -> impl iced::futures::Stream<Item = Message> {
@@ -2549,19 +2969,6 @@ fn apricot_surface(_theme: &Theme) -> container::Style {
 fn inset_surface(_theme: &Theme) -> container::Style {
     tinted_surface(BACKGROUND, 16.0)
 }
-fn segment_surface(_theme: &Theme) -> container::Style {
-    tinted_surface(BACKGROUND, 14.0)
-}
-fn drop_surface(_theme: &Theme) -> container::Style {
-    container::Style {
-        border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: 18.0.into(),
-        },
-        ..tinted_surface(Color::from_rgb8(248, 250, 246), 18.0)
-    }
-}
 fn error_surface(_theme: &Theme) -> container::Style {
     container::Style {
         text_color: Some(RED),
@@ -2651,35 +3058,6 @@ fn nav<'a>(icon: &'a str, label: &'a str, page: Page, current: Page) -> Element<
             if active { Color::WHITE } else { MUTED },
             status,
         )
-    })
-    .into()
-}
-
-fn segment(label: &str, composer: Composer, current: Composer) -> Element<'_, Message> {
-    let active = composer == current;
-    button(
-        text(label)
-            .size(14)
-            .font(if active { bold_font() } else { default_font() }),
-    )
-    .padding([10, 15])
-    .on_press(Message::Composer(composer))
-    .style(move |_, status| {
-        let mut style = button_surface(
-            if active {
-                Color::WHITE
-            } else {
-                Color::TRANSPARENT
-            },
-            if active { SAGE } else { MUTED },
-            status,
-        );
-        style.border.radius = 10.0.into();
-        if active {
-            style.border.color = LINE;
-            style.border.width = 1.0;
-        }
-        style
     })
     .into()
 }
@@ -2898,16 +3276,6 @@ fn excerpt(value: &str, limit: usize) -> String {
     result
 }
 
-fn test_status(value: &str) -> &'static str {
-    match value {
-        "installed" => "已确认安装",
-        "passed" => "已确认通过",
-        "failed" => "测试失败",
-        "blocked" => "验收受阻",
-        _ => "尚未验收",
-    }
-}
-
 fn copy_new(source: &Path, target: &Path, expected: u64) -> Result<(), String> {
     let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
     let mut output = fs::OpenOptions::new()
@@ -2948,6 +3316,103 @@ fn open_directory(directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_app() -> (App, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let relay =
+            Arc::new(relay_core::Relay::open(relay_core::Config::new(directory.path())).unwrap());
+        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+        let host = Arc::new(Host {
+            relay,
+            directory: directory.path().to_owned(),
+            port: 4318,
+            sender,
+            server: std::sync::Mutex::new(None),
+            discovery: None,
+            discovery_error: None,
+        });
+        let (app, _) = App::boot(host, false, None);
+        (app, directory)
+    }
+
+    #[test]
+    fn dropping_files_only_stages_until_send_and_persistence_acknowledgement() {
+        let (mut app, directory) = isolated_app();
+        let path = directory.path().join("original.txt");
+        fs::write(&path, "中文原文件\n").unwrap();
+        let _ = app.update(Message::FilesValidated(vec![path.clone()], 0));
+        assert_eq!(app.draft_files, vec![path.clone()]);
+        assert!(app.queue.is_empty());
+        assert!(app.importing.is_none());
+        let _ = app.update(Message::Send);
+        assert!(app.draft_files.is_empty());
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].path, path);
+        assert!(uuid::Uuid::parse_str(&app.queue[0].request_id).is_ok());
+        assert!(
+            app.importing.is_none(),
+            "queue identity must persist before reading the source"
+        );
+        // First ack starts the coalesced newer write, not the import.
+        let _ = app.update(Message::PreferencesSaved(Ok(())));
+        assert!(app.importing.is_none());
+        let _ = app.update(Message::PreferencesSaved(Ok(())));
+        assert!(app.importing.is_some());
+        assert!(
+            !app.sending,
+            "file-only sends must not require a text result"
+        );
+    }
+
+    #[test]
+    fn failed_queue_persistence_keeps_source_and_stops_import() {
+        let (mut app, directory) = isolated_app();
+        let path = directory.path().join("source.apk");
+        fs::write(&path, b"source fixture").unwrap();
+        app.draft_files.push(path.clone());
+        let _ = app.update(Message::Send);
+        let _ = app.update(Message::PreferencesSaved(Err("disk full".into())));
+        assert!(app.queue_paused);
+        assert!(app.importing.is_none());
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(fs::read(path).unwrap(), b"source fixture");
+        assert!(app.error);
+    }
+
+    #[test]
+    fn oversized_text_does_not_partially_submit_attached_files() {
+        let (mut app, directory) = isolated_app();
+        let path = directory.path().join("keep.txt");
+        app.draft_files.push(path.clone());
+        app.editor = text_editor::Content::with_text(&"字".repeat(24 * 1024));
+        let _ = app.update(Message::Send);
+        assert_eq!(app.draft_files, vec![path]);
+        assert!(app.queue.is_empty());
+        assert!(app.error);
+    }
+
+    #[test]
+    fn send_shortcut_does_not_insert_an_extra_newline() {
+        let mut event = text_editor::KeyPress {
+            key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            modifiers: keyboard::Modifiers::COMMAND,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: true },
+        };
+        assert!(matches!(
+            editor_key_binding(event.clone()),
+            Some(text_editor::Binding::Custom(Message::Send))
+        ));
+        event.modifiers = keyboard::Modifiers::empty();
+        assert!(matches!(
+            editor_key_binding(event.clone()),
+            Some(text_editor::Binding::Enter)
+        ));
+        event.status = text_editor::Status::Active;
+        assert!(editor_key_binding(event).is_none());
+    }
 
     #[test]
     fn initial_window_fits_reported_windows_200_percent_work_area() {

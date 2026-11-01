@@ -1,5 +1,6 @@
 package com.kroblus.lanrelay
 
+import okhttp3.MediaType.Companion.toMediaType
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -64,7 +65,7 @@ class TransferPerformanceTest {
         assertEquals(1L, sample.remainingSeconds)
     }
 
-    @Test fun StallRequiresNewConfirmedBytesToClearAndDoesNotReuseOldEta() {
+    @Test fun StallRequiresNewNetworkBytesToClearAndDoesNotReuseOldEta() {
         val meter = ThroughputMeter(16L * 1024 * 1024, 0, 10_000)
         val moving = meter.sample(2L * 1024 * 1024, 10_500)
         assertFalse(NetworkProgressPolicy.stalled(moving, 14_499, 10_000))
@@ -75,6 +76,53 @@ class TransferPerformanceTest {
         assertFalse(NetworkProgressPolicy.stalled(resumed, 15_500, 10_000))
         assertTrue(NetworkProgressPolicy.stalled(null, 14_000, 10_000))
         assertNull(ThroughputMeter(-1, 0, 1000).sample(1024, 1500).remainingSeconds)
+    }
+
+    @Test fun SlowContinuousNetworkStaysActiveBeforeFirstDurableCheckpoint() {
+        val start = 10_000L
+        val telemetry = NetworkTelemetry(8L * 1024 * 1024, 0, start)
+        var visible: TransferMetrics? = null
+        // 128 KiB/s: a 2 MiB durability checkpoint takes 16 seconds, while
+        // real bytes continue arriving every 250 ms throughout that interval.
+        for (step in 1..64) {
+            val now = start + step * 250L
+            telemetry.observe(step * 32L * 1024, now)?.let { visible = it }
+            assertFalse("Active stream falsely stalled at ${now - start} ms", NetworkProgressPolicy.stalled(visible, now, start))
+            if (step >= 2) assertEquals(128.0 * 1024, visible!!.bytesPerSecond, 0.01)
+        }
+    }
+
+    @Test fun IdleCallbacksCannotKeepAStoppedConnectionAlive() {
+        val start = 10_000L
+        val telemetry = NetworkTelemetry(8L * 1024 * 1024, 0, start)
+        val visible = telemetry.observe(64 * 1024L, start + 500)!!
+        assertNull(telemetry.observe(64 * 1024L, start + 4500))
+        assertFalse(NetworkProgressPolicy.stalled(visible, start + 4499, start))
+        assertTrue(NetworkProgressPolicy.stalled(visible, start + 4500, start))
+        val recovered = telemetry.observe(96 * 1024L, start + 5000)!!
+        assertFalse(NetworkProgressPolicy.stalled(recovered, start + 5000, start))
+    }
+
+    @Test fun NetworkTelemetryPublishesAtMostTwicePerSecond() {
+        val start = 10_000L
+        val telemetry = NetworkTelemetry(100L * 1024 * 1024, 0, start)
+        var publications = 0
+        for (step in 1..500) if (telemetry.observe(step * 4096L, start + step * 20L) != null) publications++
+        assertEquals(20, publications)
+    }
+
+    @Test fun UploadProgressIsBoundedAndCanCancelBeforeSendingTheNextBytes() {
+        val bytes = ByteArray(150 * 1024) { it.toByte() }
+        val sink = okio.Buffer()
+        val calls = mutableListOf<Long>()
+        val body = UploadProgressBody(bytes, bytes.size, "application/octet-stream".toMediaType()) { written ->
+            calls += written
+            if (written == 64 * 1024L) throw TransferPaused()
+        }
+        assertThrows(TransferPaused::class.java) { body.writeTo(sink) }
+        assertEquals(listOf(0L, 64 * 1024L), calls)
+        assertEquals(64 * 1024L, sink.size)
+        assertArrayEquals(bytes.copyOf(64 * 1024), sink.readByteArray())
     }
 
     @Test fun SinglePassCopyHashesExactlyTheWrittenBytes() {

@@ -1,8 +1,8 @@
 #ifndef AppVersion
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
 #endif
 #ifndef SourceDirectory
-#define SourceDirectory "..\..\output\dist\windows\LanRelay-0.4.0-windows-x64"
+#define SourceDirectory "..\..\output\dist\v0.5.0\windows\LanRelay-0.5.0-windows-x64"
 #endif
 
 [Setup]

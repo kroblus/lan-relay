@@ -117,6 +117,7 @@ impl Relay {
             CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,device_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS invitations(id INTEGER PRIMARY KEY CHECK(id=1),token_hash TEXT NOT NULL,code_hash TEXT NOT NULL,expires_at INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS pairs(id TEXT PRIMARY KEY,name TEXT NOT NULL,claim_hash TEXT NOT NULL,status TEXT NOT NULL,device_id TEXT,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS discovery_pairs(pair_id TEXT PRIMARY KEY REFERENCES pairs(id) ON DELETE CASCADE,peer_id TEXT NOT NULL,verification_code TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,request_id TEXT NOT NULL,body TEXT NOT NULL,UNIQUE(device_id,request_id));
             CREATE TABLE IF NOT EXISTS items(id TEXT PRIMARY KEY,device_id TEXT NOT NULL,kind TEXT NOT NULL,request_id TEXT NOT NULL,request_fingerprint TEXT NOT NULL,created_at INTEGER NOT NULL,body TEXT NOT NULL,UNIQUE(device_id,kind,request_id));
             CREATE INDEX IF NOT EXISTS items_cursor ON items(created_at DESC,id DESC);
@@ -171,6 +172,7 @@ impl Relay {
                 "feedback",
                 "native_owner",
                 "events",
+                "discovery_pairing",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -291,9 +293,69 @@ impl Relay {
             id: new_id(),
             claim_token: random_token(),
             expires_at: now_ms() + CLAIM_LIFETIME,
+            verification_code: None,
         };
         tx.execute("INSERT INTO pairs(id,name,claim_hash,status,created_at,expires_at) VALUES(?,?,?,'pending',?,?)", params![ticket.id,request.name.trim(),digest(ticket.claim_token.as_bytes()),now_ms(),ticket.expires_at])?;
         tx.execute("UPDATE invitations SET used=1 WHERE id=1", [])?;
+        tx.commit()?;
+        self.changed();
+        Ok(ticket)
+    }
+
+    pub fn request_discovery_pair(&self, request: NewDiscoveryPairRequest) -> Result<PairTicket> {
+        short_text(&request.name, 80, "设备名称")?;
+        if request.server_id != self.server_id {
+            return Err(RelayError::new(
+                409,
+                "SERVER_ID_CHANGED",
+                "电脑身份已改变，请重新查找设备",
+            ));
+        }
+        if Uuid::parse_str(&request.peer_id).is_err() || request.peer_id.len() != 36 {
+            return Err(bad("INVALID_PEER_ID", "附近设备标识不正确"));
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pairs WHERE status='pending' AND expires_at>?",
+            [now_ms()],
+            |r| r.get(0),
+        )?;
+        if pending >= 20 {
+            return Err(RelayError::new(
+                429,
+                "PAIR_QUEUE_FULL",
+                "等待确认的设备过多，请在电脑处理后重试",
+            ));
+        }
+        // The installation ID is untrusted discovery metadata, never an actor.
+        // Do not return a previous claim secret for a repeated/spoofed ID.
+        let already_pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM discovery_pairs d JOIN pairs p ON p.id=d.pair_id WHERE d.peer_id=? AND p.status='pending' AND p.expires_at>?)",
+            params![request.peer_id, now_ms()], |r| r.get(0),
+        )?;
+        if already_pending {
+            return Err(RelayError::new(
+                409,
+                "PAIR_ALREADY_PENDING",
+                "这个设备已有待确认请求，请继续原请求或稍后重试",
+            ));
+        }
+        let verification_code = format!("{:06}", OsRng.gen_range(0..1_000_000));
+        let ticket = PairTicket {
+            id: new_id(),
+            claim_token: random_token(),
+            expires_at: now_ms() + INVITE_LIFETIME,
+            verification_code: Some(verification_code.clone()),
+        };
+        tx.execute(
+            "INSERT INTO pairs(id,name,claim_hash,status,created_at,expires_at) VALUES(?,?,?,'pending',?,?)",
+            params![ticket.id, request.name.trim(), digest(ticket.claim_token.as_bytes()), now_ms(), ticket.expires_at],
+        )?;
+        tx.execute(
+            "INSERT INTO discovery_pairs(pair_id,peer_id,verification_code) VALUES(?,?,?)",
+            params![ticket.id, request.peer_id, verification_code],
+        )?;
         tx.commit()?;
         self.changed();
         Ok(ticket)
@@ -336,6 +398,53 @@ impl Relay {
         tx.commit()?;
         self.changed();
         Ok(())
+    }
+
+    /// A requester may cancel only its own still-pending first-trust request.
+    /// A discovery ID or verification number is not enough, and cancellation
+    /// never revokes an already approved device.
+    pub fn cancel_pair(&self, request: ClaimRequest) -> Result<PairClaim> {
+        if request.claim_token.len() != 43 {
+            return Err(bad("INVALID_CLAIM", "配对领取凭据不正确"));
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let row: Option<(String, String, i64)> = tx
+            .query_row(
+                "SELECT claim_hash,status,expires_at FROM pairs WHERE id=?",
+                [&request.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (hash, status, expiry) = row.ok_or_else(|| missing("配对请求"))?;
+        if digest(request.claim_token.as_bytes()) != hash {
+            return Err(RelayError::new(403, "INVALID_CLAIM", "配对领取凭据不正确"));
+        }
+        if status == "approved" {
+            return Err(RelayError::new(
+                409,
+                "PAIR_ALREADY_APPROVED",
+                "电脑已确认连接，请完成连接或在电脑撤销设备",
+            ));
+        }
+        let result = if expiry <= now_ms() {
+            "expired"
+        } else {
+            "rejected"
+        };
+        if status == "pending" {
+            tx.execute(
+                "UPDATE pairs SET status='rejected' WHERE id=?",
+                [&request.id],
+            )?;
+        }
+        tx.commit()?;
+        self.changed();
+        Ok(PairClaim {
+            status: result.into(),
+            device: None,
+            token: None,
+        })
     }
 
     pub fn claim_pair(&self, request: ClaimRequest) -> Result<PairClaim> {
@@ -422,7 +531,7 @@ impl Relay {
             .query_map([], device_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let pair_requests = if actor == OWNER_ID {
-            let mut s = db.prepare("SELECT id,name,status,created_at,expires_at FROM pairs WHERE expires_at>? ORDER BY created_at DESC LIMIT 50")?;
+            let mut s = db.prepare("SELECT p.id,p.name,p.status,p.created_at,p.expires_at,d.verification_code,d.peer_id FROM pairs p LEFT JOIN discovery_pairs d ON d.pair_id=p.id WHERE p.expires_at>? ORDER BY p.created_at DESC LIMIT 50")?;
             let rows = s
                 .query_map([now_ms()], |r| {
                     Ok(PairRequest {
@@ -431,6 +540,8 @@ impl Relay {
                         status: r.get(2)?,
                         created_at: r.get(3)?,
                         expires_at: r.get(4)?,
+                        verification_code: r.get(5)?,
+                        peer_id: r.get(6)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;

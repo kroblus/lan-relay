@@ -117,6 +117,7 @@ fun TransferTask.statusLabel(): String = when (status) {
     "hashing" -> "校验原文件"
     "uploading" -> "发送中"
     "downloading" -> "接收中"
+    "retrying" -> "正在自动续传"
     "verifying" -> "校验并保存"
     "saving" -> "保存文件"
     "paused" -> "已暂停"

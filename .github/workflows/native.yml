@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 35
     env:
       CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,9 +37,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libx11-xcb-dev
       - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --all-targets
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --release -p relay-desktop -p relay-server -p relay-migrate
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo build --locked --release -p relay-desktop -p relay-server -p relay-migrate
+      - name: Windows packaging freshness regression
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tools -p 'test_delivery*.py'
       - name: Windows executable lifecycle smoke
         if: runner.os == 'Windows'
         shell: pwsh
@@ -54,12 +59,12 @@ jobs:
         run: ./packaging/windows/Build.ps1 -SkipBuild
       - name: Artifact manifest
         if: runner.os == 'Windows'
-        run: python tools/artifact_manifest.py output/dist/windows --source ${{ github.sha }}
+        run: python tools/artifact_manifest.py output/dist/v0.5.0/windows --source ${{ github.sha }}
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
           name: lan-relay-windows-${{ github.sha }}
-          path: output/dist/windows/
+          path: output/dist/v0.5.0/windows/
           if-no-files-found: error
           retention-days: 30
 
@@ -88,7 +93,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: lan-relay-android-${{ github.sha }}
-          path: output/dist/android/
+          path: output/dist/v0.5.0/android/
           if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@v4
@@ -96,4 +101,40 @@ jobs:
         with:
           name: android-reports-${{ github.sha }}
           path: apps/android/app/build/reports/
+          retention-days: 30
+
+  delivery:
+    name: Verified delivery bundle
+    needs: [rust, android]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delivery integrity tests
+        run: python -m unittest discover -s tools -p 'test_delivery*.py'
+      - uses: actions/download-artifact@v4
+        with:
+          name: lan-relay-windows-${{ github.sha }}
+          path: output/ci-input/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: lan-relay-android-${{ github.sha }}
+          path: output/ci-input/android
+      - name: Verify platform hashes and assemble aggregate manifest
+        run: >-
+          python tools/build_delivery.py
+          --windows output/ci-input/windows
+          --android output/ci-input/android
+          --output output/delivery/bundle
+          --source ${{ github.sha }}
+          --run-id ${{ github.run_id }}
+          --repository ${{ github.repository }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lan-relay-delivery-${{ github.sha }}
+          path: |
+            output/delivery/DELIVERY_MANIFEST.json
+            output/delivery/DELIVERY_SHA256SUMS.txt
+            output/delivery/LanRelay-0.5.0-delivery.zip
+          if-no-files-found: error
           retention-days: 30
