@@ -1,0 +1,66 @@
+# Android 原生客户端 · 随手传 0.3.0
+
+本模块是协议 2 的 Kotlin / Jetpack Compose 原生客户端，和 Rust 桌面配合使用。没有 WebView 内容页面或 JavaScript 原生桥。界面使用暖白与亮橙色，主要入口为内容、传输和连接。
+
+## 已实现的使用流程
+
+1. 手机与电脑处于可互访的可信局域网，电脑运行 Rust 桌面应用。
+2. 扫描电脑配对二维码，或输入局域网地址与本次六位连接码。设备名默认“我的手机”，支持“我的平板”“另一台电脑”或自定义。
+3. 核对地址并提交连接申请，在电脑窗口批准。最近连接凭据由 Android Keystore 加密保存；后台备份和设备转移明确排除它们。
+4. 原生系统文件选择器支持原图、APK、录屏、普通文件与多选。其他应用的系统分享可直接进入待发送区域，确认目标电脑后发送；文字分享先进入编辑框，不会自动发送。
+5. 文件按不超过 2 MiB 的分片发送，原文件 SHA-256 增量计算；暂停/断网/进程重启后读取电脑已确认的 offset。任务始终绑定 server_id、device_id 和内容哈希。
+6. 手机接收文件时使用可恢复的临时下载，完成 SHA-256 校验后通过 MediaStore 保存到 `下载/LANRelay`；原始字节不转码。APK 安装由用户通过系统明确操作，下载不能自动标记已安装或测试通过。
+7. APK 卡片可关联已上传截图/录屏/日志反馈，手动记录 NOT RUN、已安装、PASS、FAIL、BLOCKED，并将反馈导出 Markdown。
+
+## 后台与恢复边界
+
+- 本版采用用户在可见界面主动启动的 `dataSync` 前台服务，通知展示进度并支持暂停；没有开机自动启动、隐藏常驻或后台剪贴板监听。
+- Android 15+ 的前台服务时间限制、系统停止、权限撤销和电量/资源策略仍适用。`onTimeout` 会停止服务并保留任务；进程意外退出后，活动任务恢复为暂停，用户点继续。
+- 文档 URI 支持持久授权时保存权限；临时分享、授权失效、文件移动或删除后需要重选原文件，并重新验证大小和 SHA-256。不是所有 URI 都能永久恢复。
+- 接收任务持有已保存的分片文件，原始下载长度和 SHA 必须匹配才能发布到公共下载目录。反馈 Markdown 导出有 4 MiB 上限，并依赖已认证的附件响应。
+- 同一时间一个传输任务，防止并发缓冲和哈希拖慢手机。文件体不会整份转成内存数组或 base64。
+- 页面不可见时不轮询内容列表。已经由用户启动的传输独立于页面运行；电脑新内容会在回到应用时刷新。
+- 同 server_id 的电脑重新连接且原凭据仍有效时复用原 device_id。电脑撤销身份后重新配对会产生新身份，旧身份任务不会自动归属到新身份。
+- 离线取消先停止本机任务，并保留电脑端取消待确认状态、任务 ID 与幂等请求 ID；连回原电脑后可重试。“清理完成记录”不会移除未确认的取消记录。
+
+## 网络与权限
+
+- 允许私网 IPv4、IPv6 ULA/link-local、受控本地域名；本地域名解析结果必须仍是私网，拒绝公网、loopback、登录凭据 URL、任意文件路径入口。
+- HTTP 是明确提示的局域网明文模式；HTTPS 使用系统正常证书验证，不接受忽略证书错误。
+- API Bearer 凭据只发送给已批准 origin，HTTP 客户端不跟随重定向；凭据不放入 URL、日志、普通任务 JSON 或公共下载目录。
+- 手动发送、翻页、反馈、测试状态与传输/取消都会先读取不带凭据的 hello，核对 server_id。切换电脑时先清空旧内容和反馈对话框，避免对新电脑操作旧内容。HTTP 下这只是身份一致性检查，不提供加密或抵抗主动冒充。
+- Android 17 / target SDK 37 的 `ACCESS_LOCAL_NETWORK` 在连接前请求；相机只用于主动扫码；通知仅用于传输。不申请全盘存储、联系人或后台位置权限。
+- 这是个人可信设备共享工作区，项目标签不是权限隔离。
+
+## 构建
+
+固定版本：JDK 17（必须包含 javac）、Gradle 9.4.1、AGP 9.2.1、内置 Kotlin / Compose compiler 2.2.10；Android SDK 37 与 build-tools 36.0.0。依赖版本固定在 Gradle 文件。
+
+```sh
+./apps/android/gradlew -p apps/android --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+```
+
+Windows 使用 `apps\android\gradlew.bat -p apps\android`，后接相同任务。也可以在 Android Studio 打开 `apps/android`。标准 Gradle Wrapper 由官方 Gradle 9.4.1 生成，发行包 SHA-256 已固定；首次需要下载经校验的发行包和固定依赖。CI 也可通过官方 setup-gradle 使用同一版本。
+
+输出：
+
+- 试用 APK：`app/build/outputs/apk/debug/app-debug.apk`
+- JVM 报告：`app/build/reports/tests/testDebugUnitTest/index.html`
+- Lint：`app/build/reports/lint-results-debug.html`
+- 正式构建：`:app:assembleRelease`，默认未签名，不能直接安装。
+
+本目录 `.gitignore` 排除 SDK、构建目录、local.properties、密钥和本地环境。不要把产物、凭据或测试用户文件提交 Git。
+
+## 升级和旧版
+
+版本号 `0.3.0` / `versionCode 3`。试用包继续使用 `com.kroblus.lanrelay.preview`，正式包使用 `com.kroblus.lanrelay`，两者是不同应用。CI 的 debug 密钥不是 Owner 的长期发布密钥，不同构建不保证覆盖安装；不要通过清除应用数据掩盖签名冲突。
+
+覆盖更新需要相同 applicationId、兼容签名和合适的版本号。正式分发前由 Owner 保管长期签名密钥，私钥和密码不得进入仓库。
+
+协议 2 不复用旧 WebView 的 Cookie、localStorage 队列或临时 URI 授权，也不会自动读取/清理旧数据。升级前保留旧应用和电脑数据，按项目迁移说明处理。新 APK 需要 Rust 协议 2 服务，旧 Node 服务不能直接代替。
+
+## 验证范围
+
+JVM 测试覆盖配对链接和 URI 规则、协议版本/字段、续传状态恢复、文件身份验证、任务身份隔离和文件名处理。构建、单元测试、Lint 的实际结果见仓库验收报告；这些不能替代真机验收。
+
+仍必须在真实 Android 设备完成：扫码/批准/撤销、SAF 与系统分享、中文多行输入、原图/真实 APK/录屏双向哈希、锁屏/切后台/系统停止恢复、通知暂停、下载目录实际保存、Android 17 权限拒绝和重试、签名升级。没有执行的项目标记 NOT RUN，不推断通过。

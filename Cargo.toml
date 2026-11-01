@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/relay-core", "crates/relay-server", "crates/relay-desktop", "crates/relay-migrate"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+repository = "https://github.com/kroblus/lan-relay"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+debug = 1

@@ -1,113 +1,113 @@
 # 随手传 · LAN Relay
 
-手机与电脑在局域网中互传原图、APK、录屏、文件、文字和链接，并把真机反馈关联到正在测试的构建。
+**V0.3.0：Rust 原生桌面应用 + Android 原生客户端，局域网协议 2。**
 
-**V1：电脑运行本地服务，两端打开网页。Node.js 24+，零 npm 运行依赖，无 CDN、云账号或第三方传输服务。**
+把 APK、原图、录屏、普通文件和中文多行文字在自己的电脑与手机之间传递，并把构建、截图和测试反馈关联起来。电脑 UI、业务、网络和持久化全部使用 Rust；手机采用 Kotlin/Compose。无需 Node.js、浏览器窗口或 C# 启动器。
 
-## 开始使用
+这是等待 Windows / Android 真机验收的试用版本。自动化结果与未测项目见 [验证记录](docs/VERIFICATION.md)，给本机 Codex 的完整任务见 [验收提示词](docs/CODEX_ACCEPTANCE.md)。编译成功不等于真机验收通过。
 
-1. 在电脑安装 [Node.js 24 或更新版本](https://nodejs.org/)。
-2. 克隆或解压本项目。Windows 双击 `start.cmd`；也可以在项目目录运行 `npm start`。
-3. 在电脑浏览器打开终端打印的 **管理入口**。它含有本机 owner 密钥片段，不要转发或截图公开。
-4. 在网页的连接设备面板生成二维码；选择手机能访问的局域网地址。
-5. 手机连接同一可互访网络，扫码、填写设备名称，再在电脑上批准。
-6. 直接拖入文件或发送文字。所有已配对设备共享这个私有工作区。
+## 日常使用
 
-不需要 `npm install`。默认端口为 `4318`；按 `Ctrl+C` 停止服务。
+1. 启动 Windows 包中的 `lan-relay.exe`。再次启动会唤起已有窗口。
+2. 电脑与手机处在可互访的局域网中。在电脑选择实际 LAN 地址，显示配对二维码或六位连接码。
+3. 新版手机 App 扫码，或输入电脑地址和当前连接码。设备名称默认「我的手机」。电脑批准后开始收发。
+4. 电脑拖入文件或选择文件；手机通过文件选择器或系统分享添加文件。文字支持中文、多行和复制。
+5. 选择某个 APK 构建，将截图、录屏和问题文字关联为反馈；导出 Markdown 交给 Codex。
 
-Windows 启动器和安卓手机上的实际使用仍需在你的设备上验收；云端自动测试、Windows CI 和浏览器模拟不等于这两项实机验证。已完成的证据和未完成项以 [验证记录](docs/VERIFICATION.md) 为准。
+Windows 关闭窗口后保留托盘与服务；托盘“退出”停止本程序。电脑必须保持运行。端口占用时会报告错误，不会结束占用端口的其他程序。
 
-> 手机可连接 Wi-Fi，电脑可以使用网线。关键是两端可互访。不要把管理入口当作手机配对二维码；手机使用短期配对入口。
+## 已实现的设计
 
-## V1 功能
+- Rust Iced 独立窗口：文件、文字、构建、反馈、搜索、分页、项目整理和设备批准/撤销。
+- 本机文件直接进入 Rust 核心，有界缓冲、增量 SHA-256；本机导入队列保存请求身份，供恢复时核对原文件。
+- 原生 Android：扫码、系统分享、SAF 文件选择、持久队列、用户启动的后台传输服务、通知暂停、下载校验后保存。
+- 2 MiB 分片、默认单文件 2 GiB / 总存储 20 GiB；已确认 offset 在写盘同步后提交，重启恢复不将未提交尾部当成功。
+- 原始文件下载、HEAD、Range / If-Range；SHA-256 完整性校验。
+- 六位随机连接码/高熵二维码、电脑批准、原生 Bearer 会话和设备撤销。
+- 有边界的 APK 清单解析。无法解析的字段保持未知；元数据不证明签名或可安装性。
+- 可重复请求的文字、文件完成与反馈；反馈引用已完成文件，安装/测试状态由用户明确确认。
+- 独立 Rust 旧数据导入工具，先校验旧文件再写入新目录，保留源目录。[迁移说明](docs/MIGRATION.md)
 
-- 一次性二维码/六位码配对、电脑批准、可信设备列表与撤销。
-- 双向文件、原图、文字、链接；文件原始字节不被压缩或转码。
-- Web Worker 增量 SHA-256、分片上传、进度、取消与中断恢复。
-- 服务端流式校验和落盘，服务重启后保留已提交上传断点。
-- 已完成文件的浏览器下载、HEAD 和单段 HTTP Range 请求。
-- 图片及支持格式的音视频预览；危险或无法识别的内容只提供下载。
-- 私有内容流、已加载记录的搜索/筛选、可选项目名称、实时变化提示；较早记录可继续加载。
-- APK 内置清单元数据解析、当前测试构建、用户确认的安装/验收状态。
-- 附件＋一句话测试反馈、绑定构建、导出给 Codex 的 Markdown 材料。
-- 可选可信 HTTPS 配置。HTTP 模式下文字仍可手动复制粘贴。
+## 运行与构建
 
-## 一轮开发测试
+### Windows 桌面
 
-1. 电脑把 APK 拖入应用，选择项目。
-2. 手机下载，在 Android 系统界面完成安装。
-3. 手机选择本次测试的 APK。这个选择是测试上下文，不代表应用已自动检测安装。
-4. 回传截图、录屏或日志，并发送一句反馈；按需选择已传附件。
-5. 电脑下载该反馈的 Markdown，用原始描述、构建哈希和本机证据位置继续开发。
+安装 Rust 工具链和 Visual Studio C++ Build Tools 后，在仓库根目录执行：
 
-系统不会自动安装 APK，也不会把“点击下载”写成“已保存”“已安装”或“真机通过”。
-
-## 中断后如何继续
-
-- **手机上传到电脑**：返回网页，找到未完成任务，按界面重新选择原文件。完整 SHA-256 一致时从服务端保存的位置继续。浏览器不会永久持有你手机文件的访问权限。
-- **电脑下载到手机**：本服务支持 Range；暂停与恢复由手机浏览器下载管理器决定，不保证所有浏览器跨重启恢复。
-- **关闭电脑网页**：本地服务仍运行时，文件和任务保留。
-- **电脑休眠/关机/服务停止**：无法继续传输；重新启动后再连接。
-- **手机锁屏/切后台**：浏览器可能暂停，V1 不承诺后台持续传输。
-
-## 文件存在哪里
-
-默认保存在项目内的 `.lan-relay-data/`，目录已被 Git 忽略。数据库记录设备、传输、构建与反馈；文件本体独立保存在磁盘。
-
-- 原始手机照片、源 APK 不会被删除。
-- 取消任务只清除对应未完成上传。
-- 已完成文件在 V1 中不会自动清理；请规划磁盘容量。若要备份，先停止服务，再备份整个数据目录。
-- 不要将数据目录、owner 密钥、证书私钥或 Cookie 推送到 GitHub。
-- 同名文件分开保存，反馈关联固定文件内容。
-
-## 配置
-
-复制 `.env.example` 为 `.env`，或在启动命令的进程环境中设置：
-
-| 变量 | 默认值/用途 |
-| --- | --- |
-| `LAN_RELAY_HOST` | `0.0.0.0`，允许本机与局域网连接 |
-| `LAN_RELAY_PORT` | `4318`；托管 QA 环境也可使用 `PORT` |
-| `LAN_RELAY_DATA_DIR` | 本项目 `.lan-relay-data/` |
-| `LAN_RELAY_MAX_FILE_BYTES` | 每文件 2 GiB |
-| `LAN_RELAY_MAX_STORAGE_BYTES` | 管理文件与待传任务合计 20 GiB |
-| `LAN_RELAY_CHUNK_SIZE` | 每分片默认 2 MiB；可设置为 1 字节至 16 MiB |
-| `LAN_RELAY_TLS_KEY` / `LAN_RELAY_TLS_CERT` | 同时配置后启用 HTTPS；证书必须被客户端信任 |
-| `LAN_RELAY_APKANALYZER` | 可选 Android SDK 回退分析器；不配置也会运行内置清单解析 |
-| `LAN_RELAY_ALLOWED_ORIGINS` | 明确受信任的本地域名或反向代理/QA origin，逗号分隔；含协议和必要端口，不含路径，不支持 `*` |
-
-V1 内置解析独立 APK 的清单，支持常见 ZIP stored/deflate 与二进制 XML；不需要 Android SDK。清单压缩大小上限为 2 MiB，解压上限为 4 MiB。内置解析不处理 ZIP64、分包依赖、资源引用或签名；不支持、损坏或超限会显示明确原因，不根据文件名编造元数据。只有内置结果不可用时，才尝试明确配置的 Android SDK 可执行程序；Windows `.bat`/`.cmd` 启动器不会通过 shell 执行。这个回退不会自动补全已解析清单中的资源引用。清单解析不等于签名有效或安装兼容性通过。
-
-## 网络与权限边界
-
-- 第一版的 HTTP LAN 模式**没有传输加密**，用于自己信任的局域网。配对负责访问授权，不能代替 HTTPS。
-- 如需 HTTPS，提供合法且已受信任的证书；不要关闭浏览器证书校验。使用证书覆盖的本地域名时，还须把该精确 origin 加入 `LAN_RELAY_ALLOWED_ORIGINS`，以通过服务的 Host 检查。
-- 不要做公网端口映射。所有配对设备都能看到私有工作区中的内容，V1 没有按收件人隔离的聊天。
-- Windows 防火墙只需在你信任的专用网络允许该服务；不要关闭整台电脑的防火墙。
-- VPN、访客 Wi-Fi 隔离、地址变化和电脑睡眠可能阻断连接。
-- 手机打开电脑的 HTTP 局域网 IP，不享有本机 `localhost` 的安全上下文例外；复制按钮不可用时会提供手动操作。
-- V1 未实现 PWA 安装、系统分享目标或后台剪贴板同步；配置 HTTPS 不会自动增加这些功能。
-- 仅管理工具自己的目录；不提供任意远程命令、全盘文件浏览或自动 APK 安装。
-
-## 检查与测试
-
-```sh
-npm run check
-npm test
+```powershell
+cargo run --release -p relay-desktop
 ```
 
-测试使用临时目录和合成文件，不触碰实际收件箱。HTTP 集成测试覆盖配对、权限、CSRF、Host 校验、双向传输、断点、哈希、Range、配额、撤销和反馈导出。合成 `.apk` 夹具不是可安装应用。
+构建便携包与可用时的 Inno Setup 安装器（安装器要求 Inno Setup 6.3 或更新版本）：
 
-- [API 契约](docs/API.md)
-- [验证记录与已知限制](docs/VERIFICATION.md)
-- [交给本机 Codex 的完整测试提示词](docs/CODEX_TEST_PROMPT.md)
+```powershell
+./packaging/windows/Build.ps1
+```
 
-GitHub Actions 配置了 Windows 和 Linux 的 Node.js 24 检查。只有实际工作流返回成功时，才能声称该平台 CI 通过；真实手机验收另行记录。
+产物在 `output/dist/windows/`。图标、托盘、单实例和双击均由 Rust 桌面应用负责。工具链由 `rust-toolchain.toml` 固定，依赖由 `Cargo.lock` 锁定。
 
-## 后续范围
+指定独立测试数据目录与端口：
 
-构建目录自动登记、系统分享入口、APK 签名验证与资源图标解析、ADB 辅助安装/日志、截图标注、临时访客分享均可在真实使用后逐项扩展。V1 不将这些未来功能伪装为可用按钮。
+```powershell
+cargo run -p relay-desktop -- --data-dir output/verification/desktop-data --port 14318
+```
 
-## 第三方代码
+桌面默认 Windows 数据目录：`%LOCALAPPDATA%\LanRelay\v2`。不会自动打开或覆盖旧版 `LanRelay\data`。仓库根目录只是源码，不是默认收件箱。
 
-二维码实现来自 Nayuki QR Code generator，遵循其 MIT 许可证；完整版权和许可保留在源文件。其余具体引用以源文件声明为准。本项目自有代码暂未授予开源许可证。
+### Android
+
+要求完整 JDK 17、Android SDK 平台 37.0、Build Tools 36.0.0。Gradle 9.4.1、AGP 9.2.1 和 Compose 编译插件固定在项目中。
+
+```powershell
+cd apps/android
+./gradlew.bat --no-daemon testDebugUnitTest lintDebug assembleDebug assembleRelease
+```
+
+Linux/macOS 使用 `./gradlew`。Android Studio 也可打开 `apps/android/`。`local.properties` 和 SDK 不提交到 Git。
+
+- `app-debug.apk` 是临时调试签名试用包；以 SHA-256 标识具体产物。
+- `app-release-unsigned.apk` 需要使用长期保管的签名密钥签名后才能安装。
+- 试用包 `com.kroblus.lanrelay.preview` 与正式包 `com.kroblus.lanrelay` 是不同应用。即使包名相同，签名不兼容也不能覆盖安装；不应清除旧数据来掩盖冲突。
+
+### 无界面核心
+
+```sh
+cargo run -p relay-server -- --data-dir output/server-data --host 127.0.0.1 --port 14318
+```
+
+该入口用于协议集成，配对批准在原生桌面内进行。不存在远程匿名 owner 接口。一般使用者直接运行桌面应用。
+
+## 验证
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p relay-core --test large_transfer -- --ignored
+```
+
+最后一项单独验证 256 MiB 文件中断重启续传，不作为 Wi-Fi 吞吐基准。桌面另有隔离数据目录的 `--smoke-test`。GitHub Actions 对 Linux/Windows Rust 和 Android 单测、Lint、构建分别记录结果，并产出带源码提交与 SHA-256 清单的应用包。
+
+## 使用边界
+
+- 默认 HTTP 局域网模式没有传输加密，仅用于你信任的局域网；没有公网中转、自动端口映射或云端上传。
+- 已批准设备共享一个工作区；项目标签不提供设备间内容隔离。
+- 手机后台任务可能被系统或用户停止，恢复依赖持久队列、服务端断点和仍有效的原文件授权；不承诺永不停止。
+- Android 17 的局域网权限、相机扫码权限与系统文件授权按实际用途请求。TLS 错误不会被绕过。
+- 下载、安装和测试通过是独立状态，不会自动安装 APK、执行传来的代码或监控后台剪贴板。
+- 源码重写不意味着旧会话/未完成上传自动迁移。旧源码保存在 Git 历史，活动源码树已经替换。[迁移边界](docs/MIGRATION.md)
+
+## 项目结构
+
+| 目录 | 内容 |
+|---|---|
+| `crates/relay-core` | 共享业务、SQLite、文件完整性、APK 元数据 |
+| `crates/relay-server` | 原生客户端协议、认证、分片与下载 |
+| `crates/relay-desktop` | Iced UI、托盘、单实例、桌面交互 |
+| `crates/relay-migrate` | 旧版已完成内容的离线导入 |
+| `apps/android` | Kotlin/Compose 原生客户端与系统集成 |
+| `packaging/windows` | Windows 便携包和安装器脚本 |
+| `docs` | 协议、迁移、验证与 Codex 验收 |
+| `output` | 忽略的构建产物、测试证据与临时工具 |
+
+此前用户报告的本机 53 项测试版本未被本次云端读取，不能宣称已导入这些不可见修改。本机 Codex 应先保护原工作区再进行版本对照。

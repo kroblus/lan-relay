@@ -1,0 +1,34 @@
+[package]
+name = "relay-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "lan-relay"
+path = "src/main.rs"
+
+[dependencies]
+relay-core = { path = "../relay-core" }
+relay-server = { path = "../relay-server" }
+iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "tokio", "qr_code", "advanced-shaping", "x11", "wayland"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+fs2 = "0.4"
+notify = "8"
+if-addrs = "0.13"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.21"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+winresource = "0.1"

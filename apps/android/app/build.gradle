@@ -1,0 +1,54 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'com.kroblus.lanrelay'
+    compileSdk 37
+    buildToolsVersion '36.0.0'
+
+    defaultConfig {
+        applicationId 'com.kroblus.lanrelay'
+        minSdk 29
+        targetSdk 37
+        versionCode 3
+        versionName '0.3.0'
+        manifestPlaceholders = [appLabel: '随手传']
+    }
+    buildTypes {
+        debug {
+            applicationIdSuffix '.preview'
+            versionNameSuffix '-preview'
+            manifestPlaceholders = [appLabel: '随手传·试用']
+        }
+        release {
+            minifyEnabled false
+            // Intentionally unsigned. Production signing keys are kept by the owner.
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures { compose true; buildConfig true }
+    testOptions { unitTests.returnDefaultValues = true }
+    lint { abortOnError true }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.16.0'
+    implementation 'androidx.activity:activity-compose:1.10.1'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.9.2'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.9.2'
+    implementation platform('androidx.compose:compose-bom:2025.08.01')
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+    implementation 'com.google.zxing:core:3.5.4'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20250517'
+}

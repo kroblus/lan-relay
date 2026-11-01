@@ -1,0 +1,19 @@
+LAN Relay Android / 随手传 Android
+
+ZXing Android Embedded 4.3.0
+Copyright (C) 2012-2022 ZXing authors, Journey Mobile
+https://github.com/journeyapps/zxing-android-embedded
+Licensed under the Apache License, Version 2.0.
+
+ZXing Core 3.5.4
+Copyright ZXing authors
+https://github.com/zxing/zxing
+Licensed under the Apache License, Version 2.0.
+
+AndroidX Activity and its AndroidX runtime dependencies
+Copyright The Android Open Source Project
+https://developer.android.com/jetpack/androidx
+Licensed under the Apache License, Version 2.0.
+
+The full Apache License, Version 2.0 is included in APACHE-2.0.txt.
+No Google Play Services SDK or remote barcode model is used.
