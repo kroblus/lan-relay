@@ -1,4 +1,5 @@
 import { qrSvg } from './qr.mjs';
+import { consumeAuthIntent, createAuthIntentQueue, defaultDeviceName, pairingLink } from './auth-intent.mjs';
 
 const $ = (id) => document.getElementById(id);
 const state = {
@@ -8,7 +9,7 @@ const state = {
   pairingTimer: null, pairingRequest: null, claimTimer: null, sse: null, refreshTimer: null,
   refreshing: false, refreshAgain: false, sessionCheck: false, seenRequests: new Set(),
   jobs: [], activeJobs: 0, queueNodes: new Map(), renderQueueTimer: null, resumeTarget: null,
-  sending: false, attachmentDraft: new Set(), connectionBusy: false, lastConnection: 'connecting',
+  sending: false, attachmentDraft: new Set(), connectionBusy: false, lastConnection: 'connecting', authGeneration: 0,
 };
 const FILTERS = [
   { id: 'all', label: '所有传递', icon: '⊞', match: () => true },
@@ -30,6 +31,9 @@ const IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif
 let joinToken = '';
 let confirmResolve = null;
 let dragDepth = 0;
+const sessionMutations = new Set();
+const authenticateInOrder = createAuthIntentQueue(initialize);
+function authChanged() { const error = new Error('连接身份已经更新，本次旧操作已停止。'); error.code = 'AUTH_CHANGED'; return error; }
 
 function node(tag, className = '', text = '') {
   const element = document.createElement(tag);
@@ -96,6 +100,8 @@ function safeHttpUrl(value) {
 }
 async function api(path, options = {}) {
   const { method = 'GET', body, headers: extraHeaders = {}, signal, auth = true, csrfRetried = false } = options;
+  const generation = state.authGeneration;
+  if (auth && !state.device) throw authChanged();
   const headers = { ...extraHeaders };
   let payload = body;
   if (body !== undefined && !(body instanceof Blob) && !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body)) {
@@ -108,17 +114,24 @@ async function api(path, options = {}) {
   }
   let response;
   try {
-    response = await fetch(path, { method, headers, body: payload, signal, credentials: 'same-origin', cache: 'no-store' });
+    const request = fetch(path, { method, headers, body: payload, signal, credentials: 'same-origin', cache: 'no-store' });
+    const changesSession = ['/api/session/owner', '/api/pair/claim', '/api/session/logout'].includes(path);
+    if (changesSession) sessionMutations.add(request);
+    try { response = await request; }
+    finally { if (changesSession) sessionMutations.delete(request); }
   } catch (error) {
+    if (auth && generation !== state.authGeneration) throw authChanged();
     if (error.name === 'AbortError') throw error;
     throw new Error('暂时连不上电脑。请检查 Wi-Fi、电脑是否开机，然后重试。');
   }
   let data;
   try { data = await response.json(); } catch { data = null; }
+  if (auth && generation !== state.authGeneration) throw authChanged();
   if (!response.ok) {
     if (response.status === 403 && data?.error?.code === 'CSRF_REQUIRED' && state.device && !csrfRetried) {
       const expectedDevice = state.device;
       const session = await api('/api/session', { auth: false });
+      if (generation !== state.authGeneration) throw authChanged();
       if (session.authenticated && session.device?.id === expectedDevice.id && session.device?.role === expectedDevice.role) {
         state.csrf = session.csrfToken;
         return api(path, { ...options, csrfRetried: true });
@@ -137,7 +150,7 @@ async function api(path, options = {}) {
 }
 async function busyAction(element, action) {
   element.disabled = true;
-  try { return await action(); } catch (error) { toast(error.message || '操作未完成，请重试。', true); return null; }
+  try { return await action(); } catch (error) { if (error.code !== 'AUTH_CHANGED') toast(error.message || '操作未完成，请重试。', true); return null; }
   finally { element.disabled = false; }
 }
 function openDialog(id) { const dialog = $(id); if (!dialog.open) dialog.showModal(); }
@@ -183,29 +196,59 @@ function showJoin(message = '') {
   $('authLoading').hidden = true;
   $('pendingPanel').hidden = true;
   $('joinForm').hidden = false;
-  $('pairCodeField').hidden = Boolean(joinToken);
+  $('pairCodeField').hidden = Boolean(joinToken) && !$('pairCode').value;
   $('pairCode').required = !joinToken;
+  $('pairCode').readOnly = Boolean(joinToken);
   $('tokenNotice').hidden = !joinToken;
+  $('joinButton').disabled = false;
   setError('authError', message);
 }
-async function initialize() {
-  const fragment = new URLSearchParams(location.hash.slice(1));
-  const ownerSecret = fragment.get('owner');
-  joinToken = fragment.get('pair') || '';
-  if (ownerSecret || joinToken) history.replaceState(null, '', `${location.pathname}${location.search}`);
-  const savedName = storageGet(localStorage, 'lan-relay.device-name', '');
-  $('deviceName').value = typeof savedName === 'string' ? savedName : '';
+function clearJoinCredentials() { joinToken = ''; $('pairCode').value = ''; $('pairCode').readOnly = false; }
+async function initialize(intent, isCurrent) {
+  if (intent?.kind === 'invalid') {
+    if (state.device) toast(intent.message, true); else { clearJoinCredentials(); showJoin(intent.message); }
+    return;
+  }
   try {
+    // Opening another invitation on an already connected device must not create
+    // duplicate peers or interrupt an active upload. Verify the existing cookie.
+    if (['pair', 'code'].includes(intent?.kind) && state.device) {
+      const existingDevice = state.device;
+      const generation = state.authGeneration;
+      const existing = await api('/api/session', { auth: false });
+      if (!isCurrent()) return;
+      if (generation === state.authGeneration && state.device?.id === existingDevice.id && existing.authenticated
+        && existing.device?.id === existingDevice.id && existing.device?.role === existingDevice.role) {
+        state.csrf = existing.csrfToken; clearJoinCredentials();
+        toast('这台设备已经连接，无需重复配对。'); return;
+      }
+    }
+    const uploads = stopSessionWork();
+    if (intent) storageSet(sessionStorage, 'lan-relay.pending', null);
+    $('welcome').hidden = false; $('appShell').hidden = true;
+    $('authLoading').hidden = false; $('joinForm').hidden = true; $('pendingPanel').hidden = true;
+    // Let old cookie-changing requests finish before sending a newer login.
+    // Old claims cannot enter the UI because stopSessionWork cleared their owner.
+    await Promise.allSettled([...uploads, ...sessionMutations]);
+    if (!isCurrent()) return;
+    clearJoinCredentials();
+    joinToken = intent?.kind === 'pair' ? intent.token : '';
+    $('pairCode').value = ['pair', 'code'].includes(intent?.kind) ? intent.code : '';
     let session;
-    if (ownerSecret) session = await api('/api/session/owner', { method: 'POST', body: { secret: ownerSecret }, auth: false });
+    if (intent?.kind === 'owner') session = await api('/api/session/owner', { method: 'POST', body: { secret: intent.secret }, auth: false });
     else session = await api('/api/session', { auth: false });
-    if (session.device && session.csrfToken) { await enterApp(session); return; }
+    if (!isCurrent()) return;
+    if (session.device && session.csrfToken) {
+      clearJoinCredentials(); await enterApp(session, isCurrent);
+      if (isCurrent() && ['pair', 'code'].includes(intent?.kind)) toast('这台设备已经连接，无需重复配对。');
+      return;
+    }
     const pending = storageGet(sessionStorage, 'lan-relay.pending');
-    if (!joinToken && pending?.id && pending?.claimToken) {
+    if (!intent && pending?.id && pending?.claimToken) {
       state.pairingRequest = pending; showPending(); void pollClaim(); return;
     }
     showJoin();
-  } catch (error) { showJoin(error.message); }
+  } catch (error) { if (isCurrent()) { if (state.device) toast(error.message, true); else showJoin(error.message); } }
 }
 async function submitJoin(event) {
   event.preventDefault();
@@ -213,18 +256,21 @@ async function submitJoin(event) {
   const code = $('pairCode').value.trim();
   if (!name) { setError('authError', '先给这台设备起个名字。'); $('deviceName').focus(); return; }
   if (!joinToken && !/^\d{6}$/.test(code)) { setError('authError', '请输入电脑页面上的六位连接码。'); return; }
+  const generation = state.authGeneration;
   $('joinButton').disabled = true; setError('authError');
   try {
     const result = await api('/api/pair/requests', { method: 'POST', body: { name, ...(joinToken ? { token: joinToken } : { code }) }, auth: false });
+    if (generation !== state.authGeneration) return;
     state.pairingRequest = { id: result.id, claimToken: result.claimToken, name };
     storageSet(sessionStorage, 'lan-relay.pending', state.pairingRequest);
     storageSet(localStorage, 'lan-relay.device-name', name);
-    joinToken = ''; showPending(); void pollClaim();
+    clearJoinCredentials(); showPending(); void pollClaim();
   } catch (error) {
-    if (joinToken && ['INVALID_PAIRING', 'PAIRING_EXPIRED', 'PAIRING_INVALID'].includes(error.code)) { joinToken = ''; showJoin(error.message); }
+    if (generation !== state.authGeneration) return;
+    if (joinToken && ['INVALID_PAIRING', 'PAIRING_EXPIRED', 'PAIRING_INVALID'].includes(error.code)) { clearJoinCredentials(); showJoin(error.message); }
     else setError('authError', error.message);
   }
-  finally { $('joinButton').disabled = false; }
+  finally { if (generation === state.authGeneration) $('joinButton').disabled = false; }
 }
 function showPending(message = '') {
   $('authLoading').hidden = true; $('joinForm').hidden = true; $('pendingPanel').hidden = false;
@@ -239,7 +285,10 @@ async function pollClaim() {
     if (state.pairingRequest !== request) return;
     if (result.status === 'approved' && result.device) {
       storageSet(sessionStorage, 'lan-relay.pending', null); state.pairingRequest = null;
-      await enterApp(result); toast('连接好了，可以开始传递了'); return;
+      const generation = state.authGeneration;
+      await enterApp(result);
+      if (generation === state.authGeneration && state.device?.id === result.device.id) toast('连接好了，可以开始传递了');
+      return;
     }
     if (result.status === 'rejected' || result.status === 'expired') {
       storageSet(sessionStorage, 'lan-relay.pending', null); state.pairingRequest = null;
@@ -251,16 +300,19 @@ async function pollClaim() {
     // A response can be lost after the claim set its cookie. Recover without consuming twice.
     try {
       const session = await api('/api/session', { auth: false });
+      if (state.pairingRequest !== request) return;
       if (session.authenticated && session.device) {
         storageSet(sessionStorage, 'lan-relay.pending', null); state.pairingRequest = null;
         await enterApp(session); return;
       }
     } catch { /* Keep the pending claim; connectivity can recover. */ }
+    if (state.pairingRequest !== request) return;
     showPending(error.message);
   }
   if (state.pairingRequest === request) state.claimTimer = setTimeout(pollClaim, 2200);
 }
-async function enterApp(session) {
+async function enterApp(session, isCurrent = () => true) {
+  const generation = state.authGeneration;
   state.device = session.device; state.csrf = session.csrfToken;
   state.items = []; state.devices = []; state.requests = []; state.seenRequests.clear();
   state.feedLoaded = false; state.filter = 'all'; state.query = ''; $('searchInput').value = '';
@@ -279,6 +331,7 @@ async function enterApp(session) {
   state.attachments = new Set(Array.isArray(draft.attachments) ? draft.attachments : []);
   renderFilters(); renderCurrentBuild(); renderComposerMode(); renderSelectedAttachments();
   const results = await Promise.allSettled([loadItems(true), loadInfo(), loadDevices(), restoreQueue(), loadRequests()]);
+  if (generation !== state.authGeneration || !isCurrent()) return;
   for (const result of results) if (result.status === 'rejected') toast(result.reason.message, true);
   connectEvents();
 }
@@ -290,22 +343,37 @@ function persistDraft() {
 }
 async function verifySession() {
   if (state.sessionCheck || !state.device) return;
+  const generation = state.authGeneration;
   state.sessionCheck = true;
   try {
     const session = await api('/api/session', { auth: false });
+    if (generation !== state.authGeneration) return;
     if (!session.authenticated || !session.device) disconnectUI('此设备的连接已失效，可能已被撤销。请重新申请连接。');
     else if (session.device.id !== state.device.id || session.device.role !== state.device.role) disconnectUI('此浏览器的登录身份已变化，请刷新页面重新进入。');
     else state.csrf = session.csrfToken;
-  } catch { setConnectionStatus('offline'); }
-  finally { state.sessionCheck = false; }
+  } catch { if (generation === state.authGeneration) setConnectionStatus('offline'); }
+  finally { if (generation === state.authGeneration) state.sessionCheck = false; }
 }
-function disconnectUI(message = '') {
+function stopSessionWork() {
   persistDraft(); persistQueue();
+  state.authGeneration += 1;
+  const runningUploads = state.jobs.map((job) => job.running).filter(Boolean);
+  state.device = null; state.csrf = '';
   state.sse?.close(); state.sse = null;
-  clearTimeout(state.refreshTimer); clearInterval(state.pairingTimer);
+  clearTimeout(state.refreshTimer); clearInterval(state.pairingTimer); clearTimeout(state.claimTimer);
+  clearTimeout(state.renderQueueTimer); state.renderQueueTimer = null;
   for (const job of state.jobs) { job.stopped = true; job.controller?.abort(); job.cancelHash?.(); }
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
-  state.pairing = null; state.currentBuild = null; state.items = []; state.jobs = [];
+  state.pairing = null; state.pairingRequest = null; state.currentBuild = null; state.info = null;
+  state.items = []; state.jobs = []; state.resumeTarget = null;
+  state.refreshing = false; state.refreshAgain = false; state.sessionCheck = false;
+  state.loadingMore = false; state.connectionBusy = false;
+  state.sending = false; $('sendText').disabled = false;
+  dragDepth = 0; $('dropOverlay').hidden = true;
+  return runningUploads;
+}
+function disconnectUI(message = '') {
+  stopSessionWork(); clearJoinCredentials();
   showJoin(message);
 }
 function setConnectionStatus(status) {
@@ -332,15 +400,17 @@ function scheduleRefresh() {
 }
 async function refreshState() {
   if (!state.device) return;
+  const generation = state.authGeneration;
   if (state.refreshing) { state.refreshAgain = true; return; }
   state.refreshing = true;
   do {
     state.refreshAgain = false;
     const results = await Promise.allSettled([loadItems(), loadInfo(), loadDevices(), loadRequests()]);
+    if (generation !== state.authGeneration) return;
     for (const result of results) {
       if (result.status === 'rejected' && result.reason.status === 401) void verifySession();
     }
-  } while (state.refreshAgain && state.device);
+  } while (state.refreshAgain && state.device && generation === state.authGeneration);
   state.refreshing = false;
 }
 async function loadInfo() {
@@ -385,6 +455,7 @@ async function loadItems(initial = false) {
       if (current?.isApk) { state.currentBuild = current; renderCurrentBuild(); }
     }
   } catch (error) {
+    if (error.code === 'AUTH_CHANGED') return;
     $('feed').setAttribute('aria-busy', 'false');
     $('feedErrorText').textContent = error.message; $('feedError').hidden = false;
     if (!state.feedLoaded) $('feed').replaceChildren(node('div', 'empty-inline', '记录暂时未能加载，已有内容没有被清除。'));
@@ -393,6 +464,7 @@ async function loadItems(initial = false) {
 }
 async function loadMore() {
   if (state.loadingMore || !state.items.length) return;
+  const generation = state.authGeneration;
   state.loadingMore = true; $('loadMore').disabled = true;
   try {
     const oldest = state.items[state.items.length - 1];
@@ -403,8 +475,8 @@ async function loadMore() {
     state.items = [...merged.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
     state.hasMore = (result.items || []).length === 200;
     renderFeed(); renderFilters(); renderProjectSuggestions();
-  } catch (error) { toast(error.message, true); }
-  finally { state.loadingMore = false; $('loadMore').disabled = false; }
+  } catch (error) { if (error.code !== 'AUTH_CHANGED') toast(error.message, true); }
+  finally { if (generation === state.authGeneration) { state.loadingMore = false; $('loadMore').disabled = false; } }
 }
 function renderFilters() {
   const fragment = document.createDocumentFragment();
@@ -594,6 +666,7 @@ async function sendText(event) {
     setError('composerError', '反馈附件还没传完。可以等待完成，或在队列中取消未完成的附件后再发送。'); return;
   }
   const project = $('projectInput').value.trim();
+  const generation = state.authGeneration;
   state.sending = true; $('sendText').disabled = true; setError('composerError');
   try {
     const body = { text, project, ...(state.currentBuild ? { buildId: state.currentBuild.id } : {}) };
@@ -605,8 +678,8 @@ async function sendText(event) {
     if (endpoint === '/api/feedback') for (const id of body.attachmentIds) state.attachments.delete(id);
     mergeItem(result.item); renderSelectedAttachments(); persistDraft();
     toast(endpoint === '/api/feedback' ? '反馈已保存，可在电脑上导出' : '已发送');
-  } catch (error) { setError('composerError', error.message); }
-  finally { state.sending = false; $('sendText').disabled = false; }
+  } catch (error) { if (error.code !== 'AUTH_CHANGED') setError('composerError', error.message); }
+  finally { if (generation === state.authGeneration) { state.sending = false; $('sendText').disabled = false; } }
 }
 function mergeItem(item) {
   if (!item?.id) return;
@@ -622,6 +695,7 @@ async function openConnection() {
   if (!state.device) return;
   openDialog('connectionDialog');
   if (state.connectionBusy) return;
+  const generation = state.authGeneration;
   state.connectionBusy = true;
   $('connectionLoading').hidden = false; $('connectionContent').hidden = true; setError('connectionError');
   try {
@@ -632,16 +706,17 @@ async function openConnection() {
     else if (state.pairing) renderPairing();
     renderDevices(); renderRequests(); renderConnectionFacts();
     $('connectionContent').hidden = false;
-  } catch (error) { setError('connectionError', error.message); }
-  finally { state.connectionBusy = false; $('connectionLoading').hidden = true; }
+  } catch (error) { if (error.code !== 'AUTH_CHANGED') setError('connectionError', error.message); }
+  finally { if (generation === state.authGeneration) { state.connectionBusy = false; $('connectionLoading').hidden = true; } }
 }
 async function generatePairing() {
   if (state.device?.role !== 'owner') return;
+  const generation = state.authGeneration;
   $('refreshPairing').disabled = true;
   try {
     state.pairing = await api('/api/pairing', { method: 'POST', body: {} });
     renderPairing(); setError('connectionError');
-  } finally { $('refreshPairing').disabled = false; }
+  } finally { if (generation === state.authGeneration) $('refreshPairing').disabled = false; }
 }
 function renderPairing() {
   const pairing = state.pairing;
@@ -650,14 +725,12 @@ function renderPairing() {
   const addresses = [];
   for (const address of pairing.urls?.length ? pairing.urls : state.info?.urls || []) {
     try {
-      const url = new URL(address);
-      if (!['http:', 'https:'].includes(url.protocol)) continue;
-      url.hash = new URLSearchParams({ pair: pairing.token }).toString();
+      const url = new URL(pairingLink(address, pairing));
       if (!addresses.some((entry) => entry.url === url.href)) addresses.push({ url: url.href, label: url.origin, preview: false });
     } catch { /* Ignore an invalid address, never render it as HTML. */ }
   }
   if (!addresses.some((entry) => new URL(entry.url).origin === location.origin)) {
-    const url = new URL('/', location.origin); url.hash = new URLSearchParams({ pair: pairing.token }).toString();
+    const url = new URL(pairingLink(new URL('/', location.origin).href, pairing));
     addresses.push({ url: url.href, label: `${url.origin}（当前页面 / 预览入口）`, preview: true });
   }
   const selected = addresses.find((entry) => new URL(entry.url).origin === previousOrigin) || addresses[0];
@@ -873,12 +946,14 @@ function persistQueue() {
   storageSet(localStorage, deviceKey('queue'), saved);
 }
 async function restoreQueue() {
+  const generation = state.authGeneration;
   const saved = storageGet(localStorage, deviceKey('queue'), []);
   const stored = Array.isArray(saved) ? saved.filter((entry) => entry && typeof entry.name === 'string' && Number.isSafeInteger(entry.size) && entry.size >= 0) : [];
   let uploads = [];
   let failed = null;
   try { const result = await api('/api/uploads'); uploads = result.uploads || []; }
   catch (error) { failed = error; }
+  if (generation !== state.authGeneration) return;
   const pending = uploads.filter((upload) => upload.status !== 'complete');
   const used = new Set();
   const restored = [];
@@ -1001,7 +1076,7 @@ async function refreshUpload(job, signal) {
 }
 async function recoverCreatedUpload(job) {
   if (!job.creationAttempted || !job.sha256 || job.uploadId) return;
-  const result = await api('/api/uploads');
+  const result = await api('/api/uploads', { signal: job.controller?.signal });
   const usedIds = new Set(state.jobs.filter((entry) => entry !== job).map((entry) => entry.uploadId).filter(Boolean));
   const matches = (result.uploads || []).filter((upload) => !usedIds.has(upload.id) && upload.status !== 'complete'
     && upload.size === job.size && upload.sha256 === job.sha256
@@ -1106,10 +1181,12 @@ async function resumeSelectedFile(event) {
 }
 async function cancelJob(job) {
   if (job.status === 'complete' || job.status === 'canceled' || job.status === 'canceling') return;
+  const generation = state.authGeneration;
   job.cancelRequested = true; job.stopped = true; job.status = 'canceling';
   job.controller?.abort(); job.cancelHash?.(); renderQueue(); persistQueue();
   try {
     if (job.running) await job.running;
+    if (generation !== state.authGeneration) throw authChanged();
     if (!job.uploadId && job.creationAttempted) await recoverCreatedUpload(job);
     if (job.uploadId) {
       try { await api(`/api/uploads/${encodeURIComponent(job.uploadId)}`, { method: 'DELETE' }); }
@@ -1128,16 +1205,22 @@ async function cancelJob(job) {
     }
     job.status = 'canceled'; job.file = null; job.uploadId = ''; job.cancelRequested = false;
     void loadInfo().catch(() => {});
-  } catch (error) { job.status = 'cancel-pending'; job.error = error.message; toast('发送已停止；连接恢复后请重试清理临时文件。', true); }
-  finally { persistQueue(); renderQueue(); }
+  } catch (error) { job.status = 'cancel-pending'; job.error = error.message; if (error.code !== 'AUTH_CHANGED') toast('发送已停止；连接恢复后请重试清理临时文件。', true); }
+  finally { if (generation === state.authGeneration) { persistQueue(); renderQueue(); } }
 }
 
 function bindEvents() {
   $('joinForm').addEventListener('submit', submitJoin);
+  $('deviceName').value = defaultDeviceName(storageGet(localStorage, 'lan-relay.device-name'));
+  const updateNamePresets = () => {
+    for (const preset of document.querySelectorAll('[data-device-name]')) preset.setAttribute('aria-pressed', String(preset.dataset.deviceName === $('deviceName').value));
+  };
+  for (const preset of document.querySelectorAll('[data-device-name]')) preset.addEventListener('click', () => { $('deviceName').value = preset.dataset.deviceName; updateNamePresets(); });
+  $('deviceName').addEventListener('input', updateNamePresets); updateNamePresets();
   $('pairCode').addEventListener('input', () => { $('pairCode').value = $('pairCode').value.replace(/\D/g, '').slice(0, 6); });
-  $('cancelJoin').addEventListener('click', () => { clearTimeout(state.claimTimer); state.pairingRequest = null; storageSet(sessionStorage, 'lan-relay.pending', null); joinToken = ''; showJoin(); });
+  $('cancelJoin').addEventListener('click', () => { clearTimeout(state.claimTimer); state.pairingRequest = null; storageSet(sessionStorage, 'lan-relay.pending', null); clearJoinCredentials(); showJoin(); });
   for (const id of ['connectButton', 'mobileConnect', 'connectionDetailsButton']) $(id).addEventListener('click', () => void openConnection());
-  $('refreshPairing').addEventListener('click', () => void generatePairing().catch((error) => setError('connectionError', error.message)));
+  $('refreshPairing').addEventListener('click', () => void generatePairing().catch((error) => { if (error.code !== 'AUTH_CHANGED') setError('connectionError', error.message); }));
   $('pairAddress').addEventListener('change', () => { state.pairingUrl = $('pairAddress').value; renderPairQr(); });
   $('copyPairLink').addEventListener('click', () => void copyText(state.pairingUrl));
   $('logoutButton').addEventListener('click', async () => {
@@ -1204,10 +1287,14 @@ function bindEvents() {
   window.addEventListener('offline', () => { if (state.device) setConnectionStatus('offline'); });
   window.addEventListener('online', () => { if (state.device) { setConnectionStatus('connecting'); scheduleRefresh(); } });
   window.addEventListener('pagehide', () => { persistDraft(); persistQueue(); });
+  window.addEventListener('hashchange', () => {
+    const intent = consumeAuthIntent(location, history);
+    if (intent) void authenticateInOrder(intent);
+  });
   window.addEventListener('beforeunload', (event) => {
     if (state.jobs.some((job) => ACTIVE_STATES.has(job.status))) { event.preventDefault(); event.returnValue = ''; }
   });
 }
 
 bindEvents();
-void initialize();
+void authenticateInOrder(consumeAuthIntent(location, history));

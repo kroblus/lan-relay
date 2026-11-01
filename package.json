@@ -1,6 +1,6 @@
 {
   "name": "lan-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "随手传：本地优先的手机电脑内容传输与真机测试接力工具",
   "type": "module",
@@ -10,7 +10,7 @@
     "dev": "node src/cli.mjs",
     "check": "node scripts/check.mjs",
     "build": "node scripts/check.mjs",
-    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs apps/windows/tests/*.test.mjs"
   },
   "license": "UNLICENSED"
 }

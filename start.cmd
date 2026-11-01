@@ -8,4 +8,6 @@ if errorlevel 1 (
   exit /b 1
 )
 node src\cli.mjs
-if errorlevel 1 pause
+set "LAN_RELAY_EXIT=%errorlevel%"
+if not "%LAN_RELAY_EXIT%"=="0" pause
+exit /b %LAN_RELAY_EXIT%

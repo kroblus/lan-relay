@@ -241,6 +241,12 @@ test('APK feedback binds to immutable build and exports facts without invented i
   assert.equal(exported.status, 200);
   const md = await exported.text();
   assert.ok(md.includes(feedbackText)); assert.ok(md.includes(apk.sha256)); assert.ok(md.includes('日志.txt'));
+  const exportHead = await peer.call(`/api/feedback/${feedback.id}/export`, { method: 'HEAD' });
+  assert.equal(exportHead.status, 200, 'native download preflight must support feedback export');
+  assert.match(exportHead.headers.get('content-disposition'), /^attachment;/);
+  assert.equal(Number(exportHead.headers.get('content-length')), Buffer.byteLength(md));
+  assert.equal(await exportHead.text(), '');
+  assert.equal((await fetch(base + `/api/feedback/${feedback.id}/export`, { method: 'HEAD' })).status, 401);
   const { item: marked } = await peer.json(`/api/items/${apk.id}`, { method: 'PATCH', json: { testStatus: 'user-confirmed-installed' } });
   assert.equal(marked.testStatus, 'user-confirmed-installed');
   const forged = await peer.call(`/api/items/${apk.id}`, { method: 'PATCH', json: { testStatus: 'adb-installed' } });

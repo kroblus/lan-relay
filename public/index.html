@@ -22,9 +22,10 @@
         <div id="authLoading" class="auth-card"><span class="spinner" aria-hidden="true"></span><h2>正在连接随手传</h2><p class="muted">检查这台设备的连接状态…</p></div>
         <form id="joinForm" class="auth-card" hidden>
           <span class="eyebrow">第一次见面</span><h2>连接你的电脑</h2><p class="muted">给这台设备起个名字，再到电脑上确认连接。</p>
-          <label class="field">设备名称<input id="deviceName" name="name" maxlength="60" autocomplete="off" placeholder="例如：我的安卓手机" required></label>
+          <label class="field">设备名称<input id="deviceName" name="name" value="我的手机" maxlength="60" autocomplete="off" placeholder="选择常用名称，或直接自定义" required></label>
+          <div class="device-name-presets" role="group" aria-label="常用设备名称"><button class="button quiet small" type="button" data-device-name="我的手机" aria-pressed="true">我的手机</button><button class="button quiet small" type="button" data-device-name="我的平板" aria-pressed="false">我的平板</button><button class="button quiet small" type="button" data-device-name="另一台电脑" aria-pressed="false">另一台电脑</button></div>
           <label id="pairCodeField" class="field">六位连接码<input id="pairCode" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000"></label>
-          <p id="tokenNotice" class="inline-note" hidden>已读取扫码连接信息，填写设备名称即可继续。</p>
+          <p id="tokenNotice" class="inline-note" hidden>已读取本次扫码连接信息，确认设备名称即可继续。</p>
           <p id="authError" class="inline-error" role="alert" hidden></p>
           <button id="joinButton" class="button primary wide" type="submit">申请连接 <span aria-hidden="true">↗</span></button>
           <details class="auth-help"><summary>连接码在哪里？</summary><p>在电脑的随手传页面中点「连接设备」。手机与电脑需要在能互相访问的同一局域网中。</p><p>如果这是电脑的首次启动，请打开终端中显示的管理链接。</p></details>

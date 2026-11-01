@@ -2,6 +2,7 @@ name: Verify LAN Relay
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -21,3 +22,112 @@ jobs:
           node-version: '24'
       - run: npm run check
       - run: npm test
+
+  windows-app:
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Download verified Node runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeVersion = '24.22.2'
+          $runtimeFile = "node-v$runtimeVersion-win-x64.zip"
+          $runtimeBase = "https://nodejs.org/dist/v$runtimeVersion"
+          $runtimeZip = Join-Path $env:RUNNER_TEMP $runtimeFile
+          Invoke-WebRequest "$runtimeBase/$runtimeFile" -OutFile $runtimeZip
+          $manifest = (Invoke-WebRequest "$runtimeBase/SHASUMS256.txt").Content
+          $line = ($manifest -split "`n") | Where-Object { $_ -match ("\s+" + [regex]::Escape($runtimeFile) + "\s*$") }
+          if (@($line).Count -ne 1) { throw 'Official Node checksum entry is missing or ambiguous.' }
+          $expectedHash = ($line.Trim() -split '\s+')[0].ToLowerInvariant()
+          if ($expectedHash -notmatch '^[a-f0-9]{64}$') { throw 'Invalid checksum format.' }
+          $actualHash = (Get-FileHash -Algorithm SHA256 $runtimeZip).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw 'Node runtime checksum mismatch.' }
+          "LAN_RELAY_BUILD_NODE_ZIP=$runtimeZip" >> $env:GITHUB_ENV
+          "LAN_RELAY_BUILD_NODE_SHA=$expectedHash" >> $env:GITHUB_ENV
+      - name: Build Windows portable app and installer
+        shell: pwsh
+        run: ./apps/windows/Build.ps1 -NodeZip $env:LAN_RELAY_BUILD_NODE_ZIP -NodeZipSha256 $env:LAN_RELAY_BUILD_NODE_SHA
+      - name: Test packaged Windows lifecycle
+        shell: pwsh
+        run: ./apps/windows/Test.ps1 -AppDirectory output/windows/payload
+      - name: Record artifact provenance
+        run: node scripts/artifact-metadata.mjs windows-x64 output/windows
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lan-relay-windows-x64
+          path: |
+            output/windows/*.exe
+            output/windows/*.zip
+            output/windows/SHA256SUMS.txt
+            output/windows/BUILD-INFO.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Preserve Windows lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-verification
+          path: output/verification/windows-*/launcher.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  android-app:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '9.6.0'
+          cache-provider: basic
+          cache-read-only: true
+      - name: Install required Android platform
+        run: sdkmanager 'platforms;android-37' 'build-tools;36.0.0' </dev/null
+      - name: Test, lint and build Android app
+        run: gradle -p apps/android --no-daemon --console=plain testDebugUnitTest lintDebug assembleDebug assembleRelease
+      - name: Verify trial APK signature
+        run: '"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose apps/android/app/build/outputs/apk/debug/app-debug.apk'
+      - name: Stage Android trial and unsigned release
+        shell: bash
+        run: |
+          mkdir -p output/android
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk output/android/lan-relay-0.2.0-android-trial.apk
+          cp apps/android/app/build/outputs/apk/release/app-release-unsigned.apk output/android/lan-relay-0.2.0-android-release-unsigned.apk
+          node scripts/artifact-metadata.mjs android output/android
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lan-relay-android
+          path: output/android/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Preserve Android test and lint evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-verification
+          path: |
+            apps/android/app/build/reports/tests/
+            apps/android/app/build/reports/lint-results-debug.*
+            apps/android/app/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 30

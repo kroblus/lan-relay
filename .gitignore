@@ -12,3 +12,17 @@ output/
 *.key
 .DS_Store
 Thumbs.db
+.gradle/
+.idea/
+apps/android/**/build/
+apps/android/local.properties
+apps/windows/bin/
+apps/windows/obj/
+*.apk
+*.aab
+*.exe
+*.zip
+*.jks
+*.keystore
+*.pfx
+*.p12
