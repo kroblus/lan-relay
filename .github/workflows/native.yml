@@ -33,16 +33,18 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Linux runtime libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libx11-xcb-dev
+      - name: Windows packaging freshness regression
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tools -p 'test_delivery*.py'
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked --release -p relay-desktop -p relay-server -p relay-migrate
-      - name: Windows packaging freshness regression
-        if: runner.os == 'Windows'
-        run: python -m unittest discover -s tools -p 'test_delivery*.py'
       - name: Windows executable lifecycle smoke
         if: runner.os == 'Windows'
         shell: pwsh

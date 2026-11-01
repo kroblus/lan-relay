@@ -48,35 +48,35 @@ class DeliveryIntegrityTests(unittest.TestCase):
 
     def test_mixed_source_commits_are_rejected(self):
         path = self.android / 'manifest.json'
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
         data['source_commit'] = 'b' * 40
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'source/version'):
             verified_manifest(self.android, self.source, self.version)
 
     def test_path_escape_is_rejected(self):
         path = self.windows / 'manifest.json'
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
         data['files'][0]['path'] = '../outside'
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'Unsafe'):
             verified_manifest(self.windows, self.source, self.version)
 
     def test_duplicate_manifest_entries_are_rejected(self):
         path = self.windows / 'manifest.json'
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
         data['files'].append(data['files'][0])
-        path.write_text(json.dumps(data))
+        path.write_text(json.dumps(data), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             verified_manifest(self.windows, self.source, self.version)
 
     def test_existing_evidence_is_not_overwritten(self):
         output = self.root / 'delivery'
         output.mkdir()
-        (output / 'evidence.txt').write_text('keep')
+        (output / 'evidence.txt').write_text('keep', encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'existing evidence'):
             build_delivery(self.windows, self.android, output, self.source, 123, 'fixture/relay')
-        self.assertEqual((output / 'evidence.txt').read_text(), 'keep')
+        self.assertEqual((output / 'evidence.txt').read_text(encoding='utf-8'), 'keep')
 
 
 if __name__ == '__main__':
