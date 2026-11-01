@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f8f7f3">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="在自己的手机和电脑之间，轻松传递文件、文字和测试反馈。">
+    <title>随手传 · LAN Relay</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.mjs"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#composerText">跳到发送区</a>
+    <section id="welcome" class="welcome" aria-label="连接随手传">
+      <div class="welcome-story">
+        <a class="brand" href="/" aria-label="随手传首页"><span class="brand-mark" aria-hidden="true">↗</span><span>随手传<span class="brand-en">LAN RELAY</span></span></a>
+        <div class="welcome-copy"><span class="eyebrow">让设备之间，少一点距离</span><h1>从这里，<br>传到你手里。</h1><p>一张图片、一段文字、刚打好的安装包。<br>在自己的手机和电脑之间，自然地接着做。</p><div class="welcome-pills"><span>本地保存</span><span>双向传递</span><span>随时接力</span></div></div>
+        <p class="welcome-foot">你的内容，留在你的电脑上。</p>
+      </div>
+      <div class="welcome-main">
+        <div id="authLoading" class="auth-card"><span class="spinner" aria-hidden="true"></span><h2>正在连接随手传</h2><p class="muted">检查这台设备的连接状态…</p></div>
+        <form id="joinForm" class="auth-card" hidden>
+          <span class="eyebrow">第一次见面</span><h2>连接你的电脑</h2><p class="muted">给这台设备起个名字，再到电脑上确认连接。</p>
+          <label class="field">设备名称<input id="deviceName" name="name" maxlength="60" autocomplete="off" placeholder="例如：我的安卓手机" required></label>
+          <label id="pairCodeField" class="field">六位连接码<input id="pairCode" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000"></label>
+          <p id="tokenNotice" class="inline-note" hidden>已读取扫码连接信息，填写设备名称即可继续。</p>
+          <p id="authError" class="inline-error" role="alert" hidden></p>
+          <button id="joinButton" class="button primary wide" type="submit">申请连接 <span aria-hidden="true">↗</span></button>
+          <details class="auth-help"><summary>连接码在哪里？</summary><p>在电脑的随手传页面中点「连接设备」。手机与电脑需要在能互相访问的同一局域网中。</p><p>如果这是电脑的首次启动，请打开终端中显示的管理链接。</p></details>
+        </form>
+        <section id="pendingPanel" class="auth-card" hidden aria-live="polite"><span class="pending-symbol" aria-hidden="true">↔</span><h2>等电脑点一下确认</h2><p id="pendingCopy" class="muted"></p><p class="inline-note">保持这个页面打开。确认后会自动连接。</p><button id="cancelJoin" class="button quiet wide" type="button">返回重新连接</button></section>
+      </div>
+    </section>
+
+    <div id="appShell" class="app-shell" hidden>
+      <aside class="sidebar" aria-label="内容导航">
+        <a class="brand" href="/" aria-label="随手传首页"><span class="brand-mark" aria-hidden="true">↗</span><span>随手传<span class="brand-en">LAN RELAY</span></span></a>
+        <button id="connectButton" class="connect-button" type="button"><span class="connect-icon" aria-hidden="true">⊕</span><span>连接设备<small>让另一台设备加入</small></span><span aria-hidden="true">↗</span></button>
+        <p class="section-label nav-label">你的传递</p>
+        <nav id="filters" class="filters" aria-label="筛选内容"></nav>
+        <div class="sidebar-bottom"><div class="own-device"><span class="device-dot" aria-hidden="true"></span><div><strong id="ownDeviceName">当前设备</strong><span id="ownDeviceRole">已配对设备</span></div></div><div id="storageSummary" class="storage-summary" hidden><div><span>电脑收件箱</span><span id="storageText"></span></div><div class="storage-meter" aria-hidden="true"><span id="storageFill"></span></div></div><button id="connectionDetailsButton" class="text-button connection-status" type="button"><span id="connectionDot" class="status-dot connecting" aria-hidden="true"></span><span id="connectionLabel">正在连接…</span><span aria-hidden="true">›</span></button></div>
+      </aside>
+
+      <main id="main" class="main">
+        <header class="main-header"><div><span class="eyebrow">文件、文字，还有下一次灵感</span><h1 id="feedTitle">所有传递<span id="feedCount" class="heading-count"></span></h1></div><button id="mobileConnect" class="button quiet mobile-connect" type="button" aria-label="连接设备"><span aria-hidden="true">⊕</span><span>连接</span></button><div class="search-box"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="搜索已加载的内容" aria-label="搜索已加载的内容" autocomplete="off"><kbd aria-hidden="true">/</kbd></div></header>
+        <section id="currentBuild" class="current-build" hidden aria-label="当前测试版本"><span class="build-mini-icon" aria-hidden="true">APK</span><div><span class="tiny-label">你选中的测试版本</span><strong id="currentBuildName"></strong><span id="currentBuildMeta" class="muted"></span></div><button id="writeFeedback" class="button subtle small" type="button">写反馈</button><button id="clearBuild" class="icon-button" type="button" aria-label="取消当前测试版本">×</button></section>
+        <div id="feedError" class="banner error" role="alert" hidden><span id="feedErrorText"></span><button id="retryFeed" class="text-button" type="button">重试</button></div>
+        <section id="feed" class="feed" aria-label="传递记录" aria-busy="true"><div class="feed-loading"><span class="spinner" aria-hidden="true"></span><span>正在取回传递记录…</span></div></section>
+        <div id="feedFooter" class="feed-footer" hidden><button id="loadMore" class="button quiet small" type="button">加载更早的记录</button><p>搜索与筛选作用于已加载的记录</p></div>
+
+        <div class="compose-dock">
+          <section id="queuePanel" class="queue-panel" hidden aria-label="传输队列"><div class="queue-heading"><span><span class="status-dot" aria-hidden="true"></span><strong>传输队列</strong><span id="queueCount" class="muted"></span></span><button id="clearFinished" class="text-button" type="button">清除已结束</button></div><div id="queueList" class="queue-list"></div></section>
+          <form id="composer" class="composer">
+            <div class="composer-top"><div class="mode-switch" role="group" aria-label="发送类型"><button id="textMode" class="mode-button selected" type="button" aria-pressed="true">随手传</button><button id="feedbackMode" class="mode-button" type="button" aria-pressed="false">测试反馈</button></div><label class="project-field"><span aria-hidden="true">#</span><input id="projectInput" maxlength="80" placeholder="加个项目标签" aria-label="项目标签（选填）" autocomplete="off" list="projectSuggestions"><datalist id="projectSuggestions"></datalist></label></div>
+            <div id="selectedAttachments" class="selected-attachments" hidden aria-label="已选反馈附件"></div>
+            <label class="sr-only" for="composerText">要发送的内容</label><textarea id="composerText" rows="2" placeholder="写点什么，或把文件拖到这里…" maxlength="200000"></textarea>
+            <div class="composer-bottom"><div class="composer-tools"><button id="pickFiles" class="tool-button" type="button" title="选择文件"><span aria-hidden="true">＋</span>文件</button><button id="pickAttachments" class="tool-button" type="button" hidden>已传附件</button><span id="composerHint" class="composer-hint">原图传递 · 文件保存在电脑</span></div><button id="sendText" class="button primary send-button" type="submit"><span id="sendLabel">发送</span><span aria-hidden="true">↗</span></button></div>
+            <p id="composerError" class="composer-error" role="alert" hidden></p>
+          </form>
+          <p class="dock-footnote"><span>在自己的设备之间，轻松接着做。</span><span class="desktop-hint">Ctrl / ⌘ + Enter 发送</span></p>
+        </div>
+        <div id="dropOverlay" class="drop-overlay" hidden><div><span aria-hidden="true">↙</span><strong>松开，开始传递</strong><p>图片保留原图，文件保留原样</p></div></div>
+      </main>
+    </div>
+
+    <dialog id="connectionDialog" class="dialog connection-dialog"><div class="dialog-header"><div><span class="eyebrow">相连，就很简单</span><h2>连接设备</h2></div><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><div id="connectionLoading" class="dialog-loading"><span class="spinner" aria-hidden="true"></span>正在读取连接信息…</div><div id="connectionContent" hidden><section id="ownerPairing" hidden><div class="pairing-layout"><div id="pairQr" class="pair-qr" aria-label="设备连接二维码"></div><div class="pair-instructions"><h3>手机扫一扫</h3><p>手机与电脑在同一局域网，<br>扫码后回到这里确认。</p><span class="tiny-label">也可以输入六位连接码</span><strong id="pairingCode" class="pairing-code"></strong><span id="pairExpiry" class="muted"></span><button id="refreshPairing" class="text-button" type="button">生成新的连接码</button></div></div><label class="field address-field">二维码使用的地址<select id="pairAddress" aria-label="选择二维码地址"></select></label><div class="address-actions"><code id="addressDisplay"></code><button id="copyPairLink" class="button quiet small" type="button">复制连接链接</button></div><section class="requests-section"><h3>等待你确认<span id="requestCount" class="heading-count"></span></h3><div id="pairRequests"></div></section></section><section class="devices-section"><h3>已连接的设备</h3><p class="muted small-text">这里显示已配对的设备，最近访问时间不代表设备当前在线。</p><div id="deviceList"></div></section><details class="connection-details"><summary>连接详情与遇到问题</summary><p id="transportNotice"></p><dl id="connectionFacts" class="facts"></dl><ul class="help-list"><li>手机请连接电脑所在的 Wi-Fi；蜂窝网络通常无法访问这个局域网地址。</li><li>使用真实局域网网卡地址，检查 VPN、访客网络隔离和电脑防火墙。</li><li>保持电脑开机，传输时尽量让手机页面停留在前台。</li><li>更换网络或电脑 IP 后，请重新打开连接链接。</li></ul></details><button id="logoutButton" class="text-button danger logout-button" type="button">断开此浏览器的登录</button></div><p id="connectionError" class="inline-error" role="alert" hidden></p></dialog>
+
+    <dialog id="detailDialog" class="dialog detail-dialog"><div class="dialog-header"><div><span id="detailEyebrow" class="eyebrow">内容详情</span><h2 id="detailTitle"></h2></div><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><div id="detailContent"></div></dialog>
+    <dialog id="attachmentDialog" class="dialog attachment-dialog"><div class="dialog-header"><div><span class="eyebrow">把现场一起带回来</span><h2>选择反馈附件</h2></div><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><p class="muted">选择已经完整传到电脑的文件。也可以先上传新截图或录屏。</p><div id="attachmentList" class="attachment-list"></div><div class="dialog-footer"><button id="confirmAttachments" class="button primary" type="button">选好了</button></div></dialog>
+    <dialog id="copyDialog" class="dialog copy-dialog"><div class="dialog-header"><h2>复制内容</h2><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><p class="muted">当前浏览器未开放自动复制。内容已选中，请使用系统的复制操作。</p><textarea id="copyFallback" readonly rows="7" aria-label="待复制的内容"></textarea></dialog>
+    <dialog id="confirmDialog" class="dialog confirm-dialog"><div class="dialog-header"><h2 id="confirmTitle">确认操作</h2><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><p id="confirmMessage" class="muted"></p><div class="dialog-footer"><button id="confirmCancel" class="button quiet" type="button">取消</button><button id="confirmAccept" class="button danger-fill" type="button">确认</button></div></dialog>
+
+    <input id="fileInput" type="file" multiple hidden><input id="resumeInput" type="file" hidden>
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+    <noscript><p class="noscript">随手传需要浏览器启用 JavaScript，才能安全配对并传输内容。</p></noscript>
+  </body>
+</html>
