@@ -30,6 +30,7 @@
 - 仅接受私有 IPv4、IPv6 ULA/link-local、100.64/10 地址以及单段/.local/.lan/.home.arpa 本地域名。这是地址策略，不证明网络真实路由；DNS、VPN、防火墙仍可能导致不可达。推荐电脑显示的 IPv4 地址。
 - HTTPS 使用系统信任的证书；不会忽略 SSL 错误，不在 App 内导入证书。当前连接入口不接受普通公网域名。
 - Web 页面不能直接获得原生相机、麦克风、位置或文件目录权限。扫码由独立原生扫码界面完成。
+- 除 `allowBackup=false` 外，Android 12 及以上还[显式排除云备份和设备迁移中的所有应用数据](https://developer.android.com/about/versions/12/behavior-changes-12#backup-restore)，包括 WebView Cookie 和配对状态；换机后需要重新配对。
 - 扫码、深链接和系统分享均拒绝包含 owner 凭证的电脑管理链接，不会把这类链接当作普通分享文字提供复制。
 - HEAD 禁止跳转只约束预检。入队后的 GET 及重定向由系统 DownloadManager 处理，系统可能把手工添加的 Cookie 带到跳转目标，App 无法在每一跳拦截。当前随手传核心文件与反馈导出接口不返回重定向；此下载方式依赖所连接电脑维持该行为，不能保证整个下载过程严格同源。
 - “已交给系统下载”仅表示请求入队。HEAD 成功后 Cookie 仍可能被撤销、电脑可能离线；系统下载管理器的最终结果才是依据。
