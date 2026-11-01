@@ -426,7 +426,7 @@ export async function createRelayServer(options = {}) {
       broadcast('items'); return json(res, 200, { item: publicItem(store.getItem(item.id)) });
     }
     match = /^\/api\/feedback\/([\w-]+)\/export$/.exec(pathname);
-    if (match && method === 'GET') {
+    if (match && ['GET', 'HEAD'].includes(method)) {
       const item = store.getItem(match[1]);
       if (!item || item.kind !== 'feedback') fail(404, 'FEEDBACK_NOT_FOUND', '未找到反馈记录。');
       const build = item.buildId ? store.getItem(item.buildId) : null;
@@ -447,7 +447,7 @@ export async function createRelayServer(options = {}) {
       lines.push('', '文件路径相对于随手传的数据目录。内容仅导出到当前设备，没有自动提交到外部平台。', '');
       const body = lines.join('\n');
       res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': disposition(`feedback-${item.id}.md`), 'Content-Length': Buffer.byteLength(body) });
-      return res.end(body);
+      return res.end(method === 'HEAD' ? undefined : body);
     }
     if (pathname === '/api/uploads' && method === 'GET') {
       const rows = store.db.prepare('SELECT * FROM uploads WHERE device_id=? ORDER BY created_at DESC').all(session.device.id);

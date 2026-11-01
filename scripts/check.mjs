@@ -8,7 +8,7 @@ async function walk(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    if (['node_modules', '.git', '.lan-relay-data', 'output'].includes(entry.name)) continue;
+    if (['node_modules', '.git', '.lan-relay-data', 'output', '.gradle', '.idea', 'build', 'bin', 'obj'].includes(entry.name)) continue;
     const path = resolve(dir, entry.name);
     if (entry.isDirectory()) files.push(...await walk(path));
     else files.push(path);
@@ -31,7 +31,7 @@ for (const required of ['src/cli.mjs', 'src/server.mjs', 'public/index.html', 'p
 const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' });
 if (tracked.status === 0) {
   for (const name of tracked.stdout.split('\0').filter(Boolean)) {
-    if (/^(?:\.lan-relay-data|node_modules|output)\//.test(name) || /\.(?:sqlite(?:-[\w]+)?|pem|key)$/.test(name) || (name.startsWith('.env') && name !== '.env.example')) {
+    if (/^(?:\.lan-relay-data|node_modules|output)\//.test(name) || /\.(?:sqlite(?:-[\w]+)?|pem|key|jks|keystore|pfx|p12|apk|aab|exe)$/.test(name) || /(?:^|\/)local\.properties$/.test(name) || (name.startsWith('.env') && name !== '.env.example')) {
       failed = true; console.error(`Runtime/private material must not be tracked: ${name}`);
     }
   }

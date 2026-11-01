@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 export const now = () => new Date().toISOString();
 export const id = () => randomUUID();
 export const secret = () => randomBytes(32).toString('base64url');

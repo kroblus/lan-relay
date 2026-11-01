@@ -1,6 +1,6 @@
 # V1 contract (implementation authority)
 
-Node 24 ESM built-ins, `node:sqlite`, no external npm packages. Native ES module browser UI. One private workspace: all paired devices share the same feed, not per-recipient chats. Owner can pair/revoke. Default port 4318, bind 0.0.0.0 for LAN. Files persist on host; mobile remains browser-based. HTTP development mode; optional configured trusted TLS.
+Node 24 ESM built-ins, `node:sqlite`, no external npm packages. Native ES module browser UI. One private workspace: all paired devices share the same feed, not per-recipient chats. Owner can pair/revoke. Default port 4318, bind 0.0.0.0 for LAN. Files persist on host; mobile can use a browser or the V0.2 Android WebView client with its own cookie session. HTTP development mode; optional configured trusted TLS.
 
 ## Server interface
 `src/server.mjs` exports async `createRelayServer(options={})`, returning `{ server, store, ownerSecret, listen(port=0, host='127.0.0.1'), close() }`. `listen` resolves a Node address object; `close` closes SSE and HTTP connections and SQLite. Options: `dataDir`, `publicDir`, `maxFileBytes` (default 2 GiB), `maxStorageBytes` (default 20 GiB), `chunkSize` (default 2 MiB, integer 1 byte through 16 MiB), `allowedOrigins` (additional EXACT trusted origins for managed preview), `tls` optional `{key,cert}`, `apkAnalyzerPath` optional. Host interface addresses are discovered with os.networkInterfaces; no proxies are trusted by default. CLI defaults are port 4318 and host 0.0.0.0; the programmatic listen defaults above are intentionally loopback with an ephemeral port.
@@ -8,7 +8,7 @@ Node 24 ESM built-ins, `node:sqlite`, no external npm packages. Native ES module
 HTTP API returns JSON errors `{error:{code,message,details?}}`; never leak stack traces or secrets. Auth cookie `relay_session`, HttpOnly, SameSite=Strict, Secure under TLS; long random session tokens stored hashed. All authorized mutations require `X-CSRF-Token` returned by session API. Validate present Origin against request origin or explicitly configured exact origins. Reject hostile Host/DNS rebinding; permit loopback, local interface addresses and configured preview hosts. For no-Origin API clients require JSON on unauthenticated mutations. Never turn permissive CORS on. `GET /api/events` is authenticated SSE, event `change`, payload `{type}`; client refetches small relevant state. Add heartbeat, cleanup and reconnect.
 
 ## Identity
-- `GET /api/health` -> `{ok:true,version:'0.1.0'}` (no sensitive data).
+- `GET /api/health` -> `{ok:true,version:'0.2.0'}` (no sensitive data).
 - `POST /api/session/owner` JSON `{secret,name?}` -> `{device,csrfToken}` and cookie. Bootstrap secret is generated/persisted outside git, printed by CLI in fragment URL `/#owner=...`, never exposed by unauthenticated GET.
 - `GET /api/session` -> `{authenticated:false}` or `{authenticated:true,device,csrfToken}`. Device `{id,name,role:'owner'|'peer',createdAt,lastSeenAt}`.
 - `POST /api/session/logout` -> clear cookie.
@@ -27,7 +27,7 @@ HTTP API returns JSON errors `{error:{code,message,details?}}`; never leak stack
 - `POST /api/items/text` `{text,project?,buildId?}` -> `{item}`. Max 100000 Unicode characters, project <=80 chars, blank text rejected. Preserve content. URLs are text, client only opens http/https.
 - `POST /api/feedback` `{text,project?,buildId?,attachmentIds?:string[]}` -> `{item}`. BuildId must reference an APK item if set; attachmentIds reference completed file items. Do not fabricate metadata.
 - `PATCH /api/items/:id` `{project?,note?,testStatus?}` -> `{item}`. testStatus only for APK: `not-tested`, `user-confirmed-installed`, `issue-found`, `user-confirmed-passed`. Note max 5000 chars.
-- `GET /api/feedback/:id/export` authenticated -> UTF-8 Markdown attachment with original text, known build facts, file names and host relative evidence paths; omit unknown device/installation facts explicitly. Escape Markdown injections in labels; no remote submission.
+- `GET /api/feedback/:id/export` authenticated -> UTF-8 Markdown attachment with original text, known build facts, file names and host relative evidence paths; omit unknown device/installation facts explicitly. Escape Markdown injections in labels; no remote submission. `HEAD` returns the same authenticated attachment headers and content length with no body, for native download preflight.
 
 ## Files and resumable upload
 - `POST /api/uploads` `{name,size,mime?,sha256,project?,buildId?}` -> `{upload}`. SHA256 required lower/upper hex normalized; browser computes incremental SHA256 in a Worker before upload so original identity is checked on resume. Size safe integer 0..maxFileBytes. Reserve storage quota for active uploads. Original name validated/sanitized, storage name a generated ID; never execute or expose user paths.

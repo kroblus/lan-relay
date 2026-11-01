@@ -17,3 +17,11 @@ Personal LAN app. Node.js 24+ built-ins; no runtime npm dependencies. Browser UI
 
 ## Commands
 `npm start` runs the app; `npm test` runs the meaningful Node tests; `npm run check` checks syntax and tracked secret exclusions.
+
+## Native apps (V0.2)
+- Windows packaging lives in `apps/windows`; Android source lives in `apps/android`. Keep the shared Node runtime dependency-free; native build dependencies are separate.
+- Windows opens the existing web UI in the default browser and manages its own bundled Node process. Repeated launch reuses the current user's instance. No new unauthenticated HTTP endpoint may expose an owner secret.
+- Android keeps its own WebView cookie session, uses system file selection and guarded downloads, and requests camera/local-network access only for their stated purpose. No arbitrary JavaScript bridge or SSL-error bypass.
+- Generated installers/APKs, SDKs, caches, signing keys and certificates must not be committed. Trial APK signing is distinct from a user-owned stable release signing key.
+- The user's reported local 53-test changes have not been uploaded to the inspected remote baseline `1743098`; preserve that local workspace and compare/merge before replacing their working copy. Do not claim those unseen changes or physical-device results were imported.
+- Native CI compilation, host lifecycle tests, Android unit/lint tests and actual Windows/Android acceptance are different evidence levels.
