@@ -9,11 +9,12 @@ use axum::{
         IntoResponse, Response, Sse,
     },
     routing::{get, patch, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use relay_core::{
-    ClaimRequest, NewFeedback, NewPairRequest, NewText, NewUpload, PatchItem, Relay, RelayError,
+    AuthenticatedSession, ClaimRequest, NewFeedback, NewPairRequest, NewText, NewUpload, PatchItem,
+    Relay, RelayError,
 };
 use serde::Deserialize;
 use std::{
@@ -151,7 +152,11 @@ impl IntoResponse for ApiError {
 }
 type ApiResult<T> = Result<T, ApiError>;
 
-async fn boundary(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+async fn boundary(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     // This API is for native clients. An unrelated browser origin must never gain
     // access to pairing or credentials through DNS rebinding / a permissive CORS layer.
     if request.headers().contains_key(header::ORIGIN) {
@@ -175,8 +180,14 @@ async fn boundary(State(state): State<AppState>, request: Request<Body>, next: N
             Ok(v) => v,
             Err(e) => return e.into_response(),
         };
-        if let Err(e) = work(&state, move |r| r.authenticate(&token)).await {
-            return e.into_response();
+        // Authenticate before body allocation, then reuse only within this
+        // request. Handlers recheck expiry after reading the body and core
+        // operations still check device revocation before accessing data.
+        match work(&state, move |r| r.authenticate_session(&token)).await {
+            Ok(session) => {
+                request.extensions_mut().insert(session);
+            }
+            Err(e) => return e.into_response(),
         }
     }
     let response = tokio::time::timeout(Duration::from_secs(120), next.run(request)).await;
@@ -258,10 +269,6 @@ fn bearer(headers: &HeaderMap) -> ApiResult<String> {
             ))
         })
 }
-async fn actor(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
-    let token = bearer(headers)?;
-    work(state, move |r| r.authenticate(&token)).await
-}
 
 async fn hello(State(state): State<AppState>) -> Json<relay_core::Hello> {
     Json(state.relay.hello())
@@ -305,9 +312,9 @@ async fn pair_claim(
 }
 async fn snapshot(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
 ) -> ApiResult<Json<relay_core::Snapshot>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(work(&state, move |r| r.snapshot(&a)).await?))
 }
 #[derive(Deserialize)]
@@ -317,10 +324,10 @@ struct PageQuery {
 }
 async fn items(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Json<relay_core::ItemPage>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(
         work(&state, move |r| {
             r.list_items(&a, q.before.as_deref(), q.limit.unwrap_or(100))
@@ -330,58 +337,59 @@ async fn items(
 }
 async fn text(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Json(input): Json<NewText>,
 ) -> ApiResult<Json<relay_core::Item>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(work(&state, move |r| r.create_text(&a, input)).await?))
 }
 async fn feedback(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Json(input): Json<NewFeedback>,
 ) -> ApiResult<Json<relay_core::Item>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(
         work(&state, move |r| r.create_feedback(&a, input)).await?,
     ))
 }
 async fn edit_item(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
     Json(input): Json<PatchItem>,
 ) -> ApiResult<Json<relay_core::Item>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(
         work(&state, move |r| r.patch_item(&a, &id, input)).await?,
     ))
 }
 async fn create_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Json(input): Json<NewUpload>,
 ) -> ApiResult<Json<relay_core::Upload>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(
         work(&state, move |r| r.create_upload(&a, input)).await?,
     ))
 }
 async fn get_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<relay_core::Upload>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(work(&state, move |r| r.get_upload(&a, &id)).await?))
 }
 async fn append_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
     bytes: Bytes,
 ) -> ApiResult<Json<relay_core::Upload>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -413,31 +421,31 @@ async fn append_upload(
 }
 async fn complete_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<relay_core::Item>> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     Ok(Json(
         work(&state, move |r| r.complete_upload(&a, &id)).await?,
     ))
 }
 async fn cancel_upload(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     work(&state, move |r| r.cancel_upload(&a, &id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn export_feedback(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
     method: Method,
 ) -> ApiResult<Response> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
     let filename = format!("feedback-{id}.md");
     let text = work(&state, move |r| r.export_feedback(&a, &id)).await?;
     let length = text.len();
@@ -463,10 +471,12 @@ async fn export_feedback(
 async fn download(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
     Path(id): Path<String>,
     method: Method,
 ) -> ApiResult<Response> {
-    let a = actor(&state, &headers).await?;
+    let a = session.actor()?.to_owned();
+    let mut authorization_generation = state.relay.authorization_generation();
     let info = work(&state, move |r| r.file_info(&a, &id)).await?;
     let etag = format!("\"sha256-{}\"", info.item.sha256);
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
@@ -510,16 +520,17 @@ async fn download(
             .map_err(|e| ApiError(e.into()))?;
         let token = bearer(&headers)?;
         let download_state = state.clone();
-        let mut changes = state.relay.subscribe();
         Body::from_stream(async_stream::stream! {
             let _permit=permit;
             let mut remaining=length;
-            let mut buffer=vec![0u8;64*1024];
+            let mut buffer=vec![0u8;256*1024];
             let mut checked=Instant::now();
             while remaining>0 {
-                if changes.try_recv().is_ok() || checked.elapsed()>Duration::from_secs(1){
+                let generation=download_state.relay.authorization_generation();
+                if generation != authorization_generation || checked.elapsed()>Duration::from_secs(1){
                     let credential=token.clone();
                     if work(&download_state,move|r|r.authenticate(&credential)).await.is_err(){yield Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,"device revoked"));break;}
+                    authorization_generation=generation;
                     checked=Instant::now();
                 }
                 let take=(remaining as usize).min(buffer.len());
@@ -605,9 +616,17 @@ fn parse_range(range: Option<&str>, size: u64) -> Result<(u64, u64, bool), ()> {
     Ok((start, end - start + 1, true))
 }
 
-async fn events(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
+async fn events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Extension(session): Extension<AuthenticatedSession>,
+) -> ApiResult<impl IntoResponse> {
     let token = bearer(&headers)?;
-    actor(&state, &headers).await?;
+    session.actor()?;
+    // Unlike the other handlers, SSE has no core data operation to perform the
+    // second revocation check before starting its long-lived response.
+    let credential = token.clone();
+    work(&state, move |r| r.authenticate(&credential)).await?;
     let mut receiver = state.relay.subscribe();
     let stream = async_stream::stream! {
         yield Ok::<Event,Infallible>(Event::default().event("change").data("{}"));

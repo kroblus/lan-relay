@@ -24,6 +24,8 @@ class TransferService : Service() {
     private var worker: Job? = null
     private var engine: TransferEngine? = null
     private var runningId: String? = null
+    private var lastNotificationTime = 0L
+    private var lastNotificationState = ""
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onCreate() {
         super.onCreate()
@@ -34,7 +36,13 @@ class TransferService : Service() {
             store.tasks.collectLatest { tasks ->
                 val active = tasks.firstOrNull { it.id == runningId }
                 if (active?.status in setOf("paused", "cancelled")) engine?.cancel()
-                if (worker?.isActive == true) getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(active))
+                val now = elapsedMillis()
+                val state = active?.let { it.id + ":" + it.status }.orEmpty()
+                if (worker?.isActive == true && (state != lastNotificationState || now - lastNotificationTime >= 500)) {
+                    getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(active))
+                    lastNotificationState = state
+                    lastNotificationTime = now
+                }
             }
         }
     }
@@ -109,7 +117,7 @@ fun TransferTask.statusLabel(): String = when (status) {
     "hashing" -> "校验原文件"
     "uploading" -> "发送中"
     "downloading" -> "接收中"
-    "verifying" -> "完整性校验"
+    "verifying" -> "校验并保存"
     "saving" -> "保存文件"
     "paused" -> "已暂停"
     "needs_file" -> "需要重选原文件"

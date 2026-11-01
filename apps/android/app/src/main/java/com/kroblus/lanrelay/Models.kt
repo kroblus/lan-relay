@@ -27,7 +27,7 @@ data class Hello(val protocol: Int, val serverId: String, val name: String, val 
             val size = j.getLong("max_file_bytes")
             val chunk = j.getInt("chunk_size")
             require(size > 0 && chunk in 1..(16 * 1024 * 1024)) { "电脑返回了无效传输限制。" }
-            return Hello(2, j.getString("server_id"), j.getString("name"), size, minOf(chunk, 2 * 1024 * 1024))
+            return Hello(2, j.getString("server_id"), j.getString("name"), size, minOf(chunk, 8 * 1024 * 1024))
         }
     }
 }
@@ -56,7 +56,7 @@ data class RemoteUpload(val id: String, val offset: Long, val size: Long, val ch
         fun parse(j: JSONObject): RemoteUpload {
             val value = RemoteUpload(j.getString("id"), j.getLong("offset"), j.getLong("size"), j.getInt("chunk_size"), j.getString("status"), j.getString("sha256"))
             require(value.offset in 0..value.size && value.chunkSize in 1..(16 * 1024 * 1024)) { "电脑返回了无效续传位置。" }
-            return value.copy(chunkSize = minOf(value.chunkSize, 2 * 1024 * 1024))
+            return value.copy(chunkSize = minOf(value.chunkSize, 8 * 1024 * 1024))
         }
     }
 }

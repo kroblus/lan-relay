@@ -135,7 +135,7 @@ fn icon_pixels() -> Vec<u8> {
             let color = if arrow {
                 [255, 255, 255, 255]
             } else if rounded {
-                [255, 106, 0, 255]
+                [83, 119, 98, 255]
             } else {
                 [0, 0, 0, 0]
             };

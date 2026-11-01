@@ -354,6 +354,10 @@ fn feedback_exports_exact_build_hash_and_validated_attachments() {
     assert!(md.contains(&build.sha256));
     assert!(md.contains(&image.sha256));
     assert!(md.contains("NOT RUN"));
+    assert!(md.contains("APK 包名（package_name）：未知（未解析）"));
+    assert!(md.contains("APK 版本名称（version_name）：未知（未解析）"));
+    assert!(md.contains("APK 版本号（version_code）：未知（未解析）"));
+    assert!(md.contains("测试状态（人工确认）：unverified"));
     assert!(!md.contains("server-key"));
     assert!(relay
         .create_feedback(
@@ -367,6 +371,85 @@ fn feedback_exports_exact_build_hash_and_validated_attachments() {
             }
         )
         .is_err());
+}
+
+#[test]
+fn feedback_exports_parsed_apk_identity_and_only_explicit_test_status() {
+    use base64::Engine;
+    let (_dir, relay) = workspace();
+    // A real previous manifest in a bounded ZIP fixture proves the parser and
+    // exporter work together. The fixture itself is not an installable APK.
+    let manifest = base64::engine::general_purpose::STANDARD
+        .decode(include_str!("fixtures/v0_2_manifest.b64").trim())
+        .unwrap();
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        "AndroidManifest.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(&manifest).unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let build = complete(&relay, OWNER_ID, "identity.apk", &bytes);
+    let feedback = relay
+        .create_feedback(
+            OWNER_ID,
+            NewFeedback {
+                build_id: build.id.clone(),
+                text: "核对构建身份".into(),
+                request_id: request(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let md = relay.export_feedback(OWNER_ID, &feedback.id).unwrap();
+    assert!(md.contains("APK 包名（package_name）：com.kroblus.lanrelay.preview"));
+    assert!(md.contains("APK 版本名称（version_name）：0.2.0-preview"));
+    assert!(md.contains("APK 版本号（version_code）：2"));
+    assert!(md.contains(&build.id));
+    assert!(md.contains(&build.sha256));
+    assert!(md.contains("测试状态（人工确认）：unverified"));
+    relay
+        .patch_item(
+            OWNER_ID,
+            &build.id,
+            PatchItem {
+                test_status: Some("passed".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let confirmed = relay.export_feedback(OWNER_ID, &feedback.id).unwrap();
+    assert!(confirmed.contains("测试状态（人工确认）：passed"));
+    assert!(confirmed.contains("下载不等于安装或测试通过"));
+}
+
+#[test]
+fn larger_chunks_remain_compatible_with_legacy_offsets_and_restarts() {
+    let (dir, relay) = workspace();
+    let bytes = vec![42_u8; 10 * 1024 * 1024 + 3];
+    assert_eq!(relay.hello().chunk_size, 8 * 1024 * 1024);
+    let upload = upload(&relay, OWNER_ID, "mixed-chunks.bin", &bytes);
+    // A V0.3 client may still send a 2 MiB chunk to the newer server.
+    let small = 2 * 1024 * 1024;
+    relay
+        .append_upload(OWNER_ID, &upload.id, 0, &bytes[..small])
+        .unwrap();
+    drop(relay);
+    let relay = Relay::open(Config::new(dir.path())).unwrap();
+    assert_eq!(
+        relay.get_upload(OWNER_ID, &upload.id).unwrap().offset,
+        small as u64
+    );
+    let large = small + 8 * 1024 * 1024;
+    relay
+        .append_upload(OWNER_ID, &upload.id, small as u64, &bytes[small..large])
+        .unwrap();
+    relay
+        .append_upload(OWNER_ID, &upload.id, large as u64, &bytes[large..])
+        .unwrap();
+    let item = relay.complete_upload(OWNER_ID, &upload.id).unwrap();
+    assert_eq!(item.sha256, digest(&bytes));
 }
 
 #[test]

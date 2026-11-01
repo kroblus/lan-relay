@@ -39,7 +39,7 @@ fn icon() -> Vec<u8> {
             image.extend_from_slice(if left || right {
                 &[255, 255, 255, 255]
             } else {
-                &[0, 106, 255, 255]
+                &[98, 119, 83, 255]
             });
         }
     }

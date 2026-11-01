@@ -39,9 +39,29 @@ class ProtocolTest {
     }
     @Test fun helloRejectsProtocolMismatchAndBoundsChunkSize() {
         val hello = JSONObject("""{"protocol_version":2,"server_id":"pc","name":"电脑","max_file_bytes":2147483648,"chunk_size":4194304}""")
-        assertEquals(2 * 1024 * 1024, Hello.parse(hello).chunkSize)
+        assertEquals(4 * 1024 * 1024, Hello.parse(hello).chunkSize)
         hello.put("protocol_version", 3)
         assertThrows(IllegalArgumentException::class.java) { Hello.parse(hello) }
+    }
+    @Test fun chunkNegotiationKeepsLegacyLimitsAndBoundsLargerServers() {
+        val hello = JSONObject("""{"protocol_version":2,"server_id":"pc","name":"电脑","max_file_bytes":2147483648,"chunk_size":2097152}""")
+        val upload = JSONObject("""{"id":"u","offset":0,"size":2147483648,"chunk_size":2097152,"status":"uploading","sha256":"abc"}""")
+        for ((server, expected) in listOf(2 to 2, 8 to 8, 16 to 8)) {
+            hello.put("chunk_size", server * 1024 * 1024)
+            upload.put("chunk_size", server * 1024 * 1024)
+            assertEquals(expected * 1024 * 1024, minOf(Hello.parse(hello).chunkSize, RemoteUpload.parse(upload).chunkSize))
+        }
+        upload.put("chunk_size", 2 * 1024 * 1024)
+        assertEquals(2 * 1024 * 1024, minOf(Hello.parse(hello).chunkSize, RemoteUpload.parse(upload).chunkSize))
+        hello.put("chunk_size", 2 * 1024 * 1024)
+        upload.put("chunk_size", 8 * 1024 * 1024)
+        assertEquals(2 * 1024 * 1024, minOf(Hello.parse(hello).chunkSize, RemoteUpload.parse(upload).chunkSize))
+        for (invalid in listOf(0, -1, 16 * 1024 * 1024 + 1)) {
+            hello.put("chunk_size", invalid)
+            upload.put("chunk_size", invalid)
+            assertThrows(IllegalArgumentException::class.java) { Hello.parse(hello) }
+            assertThrows(IllegalArgumentException::class.java) { RemoteUpload.parse(upload) }
+        }
     }
     @Test fun validatesCommittedOffsets() {
         val upload = JSONObject("""{"id":"upload","offset":5,"size":8,"chunk_size":4,"status":"uploading","sha256":"abc"}""")

@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$Version = '0.3.0'
+$Version = '0.4.0'
 $OutputRoot = Join-Path $ProjectRoot 'output/dist/windows'
 $PortableName = "LanRelay-$Version-windows-x64"
 $PortableDirectory = Join-Path $OutputRoot $PortableName

@@ -20,7 +20,7 @@ def manifest(folder: Path, source: str) -> None:
                       'bytes': path.stat().st_size, 'sha256': digest.hexdigest()})
     if not files:
         raise SystemExit('No application artifacts were produced')
-    result = {'product': 'LAN Relay / 随手传', 'version': '0.3.0',
+    result = {'product': 'LAN Relay / 随手传', 'version': '0.4.0',
               'protocol_version': 2, 'source_commit': source, 'files': files}
     (folder / 'manifest.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     (folder / 'SHA256SUMS.txt').write_text(''.join(f"{item['sha256']}  {item['path']}\n" for item in files), encoding='utf-8')

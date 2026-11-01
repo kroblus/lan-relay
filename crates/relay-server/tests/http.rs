@@ -363,6 +363,73 @@ async fn truncated_http_body_never_advances_offset() {
 }
 
 #[tokio::test]
+async fn slow_request_body_cannot_outlive_session_expiry_or_revocation() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for expire in [false, true] {
+        let (dir, core, server, _client, _base, token) = fixture().await;
+        let actor = core.authenticate(&token).unwrap();
+        let upload = core
+            .create_upload(
+                &actor,
+                NewUpload {
+                    name: "slow.bin".into(),
+                    size: 8,
+                    mime: "application/octet-stream".into(),
+                    sha256: digest(b"12345678"),
+                    project: String::new(),
+                    build_id: None,
+                    request_id: Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap();
+        let expires_at = now_ms() + 2000;
+        if expire {
+            let db = rusqlite::Connection::open(dir.path().join("relay-v2.sqlite")).unwrap();
+            db.execute(
+                "UPDATE sessions SET expires_at=? WHERE token_hash=?",
+                rusqlite::params![expires_at, digest(token.as_bytes())],
+            )
+            .unwrap();
+        }
+        let mut socket = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let header = format!(
+            "PATCH /api/v2/uploads/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/octet-stream\r\nUpload-Offset: 0\r\nContent-Length: 8\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            upload.id, server.addr, token
+        );
+        socket.write_all(header.as_bytes()).await.unwrap();
+        // Hyper emits 100 Continue when the authenticated handler starts polling
+        // the body. This is a barrier, rather than a timing guess about auth.
+        let mut provisional = vec![0_u8; b"HTTP/1.1 100 Continue\r\n\r\n".len()];
+        tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut provisional))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provisional, b"HTTP/1.1 100 Continue\r\n\r\n");
+        if expire {
+            let remaining = (expires_at - now_ms()).max(0) as u64 + 20;
+            tokio::time::sleep(Duration::from_millis(remaining)).await;
+        } else {
+            core.revoke_device(&actor).unwrap();
+        }
+        socket.write_all(b"12345678").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 401"));
+        assert_eq!(core.get_upload(OWNER_ID, &upload.id).unwrap().offset, 0);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("temp").join(format!("{}.part", upload.id)))
+                .unwrap()
+                .len(),
+            0
+        );
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn feedback_export_is_authenticated_attachment() {
     let (_dir, core, server, client, base, token) = fixture().await;
     let u = core
@@ -618,6 +685,8 @@ async fn peer_session_and_partial_upload_resume_after_http_restart() {
         .await
         .unwrap();
     assert_eq!(resumed.offset, 4);
+    assert_eq!(resumed.chunk_size, upload.chunk_size);
+    assert!(resumed.chunk_size < core.hello().chunk_size);
     client
         .patch(&target)
         .bearer_auth(&token)

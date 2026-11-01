@@ -20,7 +20,9 @@ impl Config {
             name: "我的电脑".into(),
             max_file_bytes: 2 * 1024 * 1024 * 1024,
             max_storage_bytes: 20 * 1024 * 1024 * 1024,
-            chunk_size: 2 * 1024 * 1024,
+            // Protocol 2 permits smaller chunks. Existing uploads retain their
+            // persisted limit, and older clients may continue sending 2 MiB.
+            chunk_size: 8 * 1024 * 1024,
         }
     }
 }

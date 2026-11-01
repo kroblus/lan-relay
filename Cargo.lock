@@ -3210,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "relay-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "fs2",
@@ -3230,12 +3230,13 @@ dependencies = [
 
 [[package]]
 name = "relay-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "fs2",
  "iced",
  "if-addrs",
  "notify",
+ "raw-window-handle",
  "relay-core",
  "relay-server",
  "rfd",
@@ -3252,7 +3253,7 @@ dependencies = [
 
 [[package]]
 name = "relay-migrate"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "relay-core",
@@ -3266,13 +3267,14 @@ dependencies = [
 
 [[package]]
 name = "relay-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "axum",
  "percent-encoding",
  "relay-core",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

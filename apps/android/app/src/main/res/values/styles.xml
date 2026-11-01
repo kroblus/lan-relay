@@ -2,12 +2,12 @@
 <resources>
     <style name="Theme.LANRelay" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#FF6A00</item>
+        <item name="android:colorAccent">#537762</item>
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:windowBackground">#FAF8F4</item>
+        <item name="android:windowBackground">#F7F8F4</item>
     </style>
-    <color name="launcher_background">#FF6A00</color>
+    <color name="launcher_background">#537762</color>
     <string name="app_name">随手传</string>
 </resources>

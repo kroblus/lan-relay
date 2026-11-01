@@ -41,6 +41,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         report.feedback,
         report.incomplete_uploads_not_imported
     );
+    if report.feedback_converted_to_text > 0 {
+        println!(
+            "其中 {} 条旧反馈按转换计划保留为文字；原引用保存在导入报告。",
+            report.feedback_converted_to_text
+        );
+    }
     for warning in report.warnings {
         println!("说明：{warning}");
     }

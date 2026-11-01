@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal class TransferPaused : Exception()
 internal class SourceUnavailable(message: String) : Exception(message)
+internal class DownloadIntegrityFailure(message: String) : Exception(message)
 
 /** One engine processes one task. No file-sized allocation, even when a provider is non-seekable. */
 class TransferEngine(private val context: Context, private val store: RelayStore, private val session: Session) {
@@ -26,16 +27,18 @@ class TransferEngine(private val context: Context, private val store: RelayStore
     private fun checkpoint() {
         if (stopped.get() || store.task(activeId)?.status in setOf("paused", "cancelled")) throw TransferPaused()
     }
-    private fun update(transform: (TransferTask) -> TransferTask) {
-        store.update(activeId) { old ->
+    private fun update(progressOnly: Boolean = false, transform: (TransferTask) -> TransferTask) {
+        val guarded: (TransferTask) -> TransferTask = { old ->
             val updated = transform(old)
             if (old.status == "cancelled") updated.copy(status = old.status, cancelPending = old.cancelPending || (updated.direction == "upload" && updated.uploadId.isNotEmpty()))
             else if (old.status == "paused") updated.copy(status = old.status) else updated
         }
+        if (progressOnly) store.updateProgress(activeId, guarded) else store.update(activeId, guarded)
     }
 
     fun run(task: TransferTask) {
         activeId = task.id
+        store.setMetrics(task.id, null)
         try {
             TransferRules.validateIdentity(task, session)
             if (task.direction != "upload" && task.savedUri.isNotEmpty()) {
@@ -87,7 +90,7 @@ class TransferEngine(private val context: Context, private val store: RelayStore
                 require(total <= maximum) { "文件超过电脑允许的单文件大小。" }
                 digest.update(buffer, 0, count)
                 if (total >= nextReport) {
-                    update { it.copy(error = "正在校验 ${formatBytes(total)}…") }
+                    update(progressOnly = true) { it.copy(error = "正在校验 ${formatBytes(total)}…") }
                     nextReport = total + 8 * 1024 * 1024
                 }
             }
@@ -119,6 +122,9 @@ class TransferEngine(private val context: Context, private val store: RelayStore
             // Reopening after a conflict also supports content providers without seekable descriptors.
             openSource(task).use { input ->
                 skipExactly(input, remote.offset)
+                // A provider may have to read to seek; source positioning is not network speed.
+                val meter = ThroughputMeter(size, remote.offset, elapsedMillis())
+                store.setMetrics(activeId, TransferMetrics())
                 while (remote.offset < size) {
                     checkpoint()
                     val count = readChunk(input, buffer, minOf(buffer.size.toLong(), size - remote.offset).toInt())
@@ -128,7 +134,8 @@ class TransferEngine(private val context: Context, private val store: RelayStore
                         val next = api.sendChunk(remote.id, before, buffer, count)
                         require(next.offset == before + count && next.size == size && next.sha256 == sha) { "电脑返回了不一致的已确认进度。" }
                         remote = next
-                        update { it.copy(offset = remote.offset, error = "") }
+                        update(progressOnly = true) { it.copy(offset = remote.offset, error = "") }
+                        store.setMetrics(activeId, meter.sample(remote.offset, elapsedMillis()))
                         conflicts = 0
                     } catch (error: ApiFailure) {
                         if (error.status != 409 || ++conflicts > 3) throw error
@@ -160,12 +167,16 @@ class TransferEngine(private val context: Context, private val store: RelayStore
         var offset = if (!export && part.exists() && part.length() <= task.size) part.length() else 0L
         val maximum = if (export) 4L * 1024 * 1024 else task.size
         update { it.copy(status = "downloading", offset = offset, error = "") }
+        var meter = ThroughputMeter(task.size, offset, elapsedMillis())
         val headers = TransferRules.downloadHeaders(offset, task.sha256)
         if (offset < maximum || export || !part.exists()) {
             api.execute(path, headers = headers).use { response ->
                 if (!response.isSuccessful) api.parseResponse(response)
                 require(response.header("Content-Disposition").orEmpty().startsWith("attachment;", ignoreCase = true)) { "电脑返回的不是文件附件。" }
-                if (offset > 0 && response.code == 200) offset = 0
+                if (offset > 0 && response.code == 200) {
+                    offset = 0
+                    meter = ThroughputMeter(task.size, 0, elapsedMillis())
+                }
                 if (offset > 0) {
                     val range = Regex("bytes (\\d+)-(\\d+)/(\\d+)").matchEntire(response.header("Content-Range").orEmpty())
                     require(response.code == 206 && range != null && range.groupValues[1].toLong() == offset && range.groupValues[3].toLong() == task.size) { "电脑返回的下载范围不正确。" }
@@ -187,7 +198,8 @@ class TransferEngine(private val context: Context, private val store: RelayStore
                             offset += count
                             if (offset - checkpointBytes >= 2 * 1024 * 1024) {
                                 output.fd.sync()
-                                update { it.copy(offset = offset) }
+                                update(progressOnly = true) { it.copy(offset = offset) }
+                                store.setMetrics(activeId, meter.sample(offset, elapsedMillis()))
                                 checkpointBytes = offset
                             }
                         }
@@ -198,27 +210,21 @@ class TransferEngine(private val context: Context, private val store: RelayStore
         }
         checkpoint()
         if (!export) require(part.length() == task.size) { "下载尚未完整，请继续恢复。" }
-        update { it.copy(status = "verifying", offset = part.length(), error = "正在校验下载文件…") }
-        val digest = MessageDigest.getInstance("SHA-256")
-        part.inputStream().use { input ->
-            val buffer = ByteArray(256 * 1024)
-            while (true) { checkpoint(); val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
-        }
-        val hash = digest.digest().toHex()
-        if (!export && hash != task.sha256) {
+        update { it.copy(status = "verifying", offset = part.length(), error = "正在校验并保存文件…") }
+        // Verify and copy in one pass. The public MediaStore entry stays IS_PENDING
+        // until both exact length and SHA match, so unverified bytes are never published.
+        val (saved, hash) = try { saveToDownloads(part, task) }
+        catch (error: DownloadIntegrityFailure) {
             part.delete()
             update { it.copy(offset = 0) }
-            throw IllegalStateException("SHA-256 不一致，损坏的临时下载已移除，请重试。")
+            throw error
         }
-        checkpoint()
-        update { it.copy(status = "saving", error = "正在保存到下载目录…") }
-        val saved = saveToDownloads(part, task)
         update { it.copy(status = "complete", savedUri = saved.toString(), size = part.length(), offset = part.length(), sha256 = hash,
             error = if (export) "反馈已导出到下载目录。" else "SHA-256 一致，已保存到下载目录。") }
         part.delete()
     }
 
-    private fun saveToDownloads(file: File, task: TransferTask): Uri {
+    private fun saveToDownloads(file: File, task: TransferTask): Pair<Uri, String> {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, "${System.currentTimeMillis()}-${TransferRules.safeName(task.name)}")
@@ -229,15 +235,15 @@ class TransferEngine(private val context: Context, private val store: RelayStore
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw IllegalStateException("无法创建下载文件。")
         update { it.copy(savedUri = uri.toString()) }
         try {
-            resolver.openOutputStream(uri, "w")?.use { output ->
-                file.inputStream().use { input ->
-                    val buffer = ByteArray(256 * 1024)
-                    while (true) { checkpoint(); val count = input.read(buffer); if (count < 0) break; output.write(buffer, 0, count) }
-                    output.flush()
-                }
+            val result = resolver.openOutputStream(uri, "w")?.use { output ->
+                file.inputStream().use { input -> TransferIo.copyAndHash(input, output, ::checkpoint) }
             } ?: throw IllegalStateException("无法写入下载目录。")
+            if (task.direction != "export" && (result.first != task.size || result.second != task.sha256)) {
+                throw DownloadIntegrityFailure("SHA-256 或文件长度不一致，损坏的临时下载已移除，请重试。")
+            }
+            checkpoint()
             require(resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) == 1) { "文件保存未完成。" }
-            return uri
+            return uri to result.second
         } catch (error: Exception) {
             resolver.delete(uri, null, null)
             update { it.copy(savedUri = "") }

@@ -60,10 +60,14 @@ class RelayStore(private val context: Context) {
     private val _connections = MutableStateFlow<List<Session>>(emptyList())
     private val _pending = MutableStateFlow<PendingPair?>(null)
     private val _tasks = MutableStateFlow<List<TransferTask>>(emptyList())
+    private val _metrics = MutableStateFlow<Map<String, TransferMetrics>>(emptyMap())
+    private var lastJournalTime = elapsedMillis()
+    private var journalOffsets: Map<String, Long> = emptyMap()
     val session = _session.asStateFlow()
     val connections = _connections.asStateFlow()
     val pending = _pending.asStateFlow()
     val tasks = _tasks.asStateFlow()
+    val metrics = _metrics.asStateFlow()
     val notice = MutableStateFlow("")
 
     init {
@@ -103,6 +107,21 @@ class RelayStore(private val context: Context) {
     @Synchronized fun update(id: String, transform: (TransferTask) -> TransferTask) {
         commitTasks(_tasks.value.map { if (it.id == id) transform(it) else it })
     }
+    @Synchronized fun updateProgress(id: String, transform: (TransferTask) -> TransferTask) {
+        val old = task(id) ?: return
+        val next = transform(old)
+        val value = _tasks.value.map { if (it.id == id) next else it }
+        val now = elapsedMillis()
+        // The remote upload offset is authoritative on every resume. This journal is a cache,
+        // while task identity, source SHA, pause/cancel and completion are always durable.
+        if (ProgressJournalPolicy.criticalChange(old, next) ||
+            (next.status != "hashing" && ProgressJournalPolicy.checkpointDue(lastJournalTime, journalOffsets[id] ?: old.offset, now, next.offset))) {
+            commitTasks(value)
+        } else _tasks.value = value
+    }
+    @Synchronized fun setMetrics(id: String, metrics: TransferMetrics?) {
+        _metrics.value = if (metrics == null) _metrics.value - id else _metrics.value + (id to metrics)
+    }
     @Synchronized fun add(task: TransferTask) {
         require(_tasks.value.size < 500) { "任务记录已达 500 条，请先清理已完成记录。" }
         commitTasks(_tasks.value + task)
@@ -110,12 +129,18 @@ class RelayStore(private val context: Context) {
     @Synchronized fun pauseAll(reason: String = "已暂停，点继续恢复。") {
         commitTasks(_tasks.value.map { if (it.active || it.status == "queued") it.copy(status = "paused", error = reason) else it })
     }
-    @Synchronized fun clearFinished() { commitTasks(_tasks.value.filter { !it.clearable }) }
+    @Synchronized fun clearFinished() {
+        val retained = _tasks.value.filter { !it.clearable }
+        commitTasks(retained)
+        _metrics.value = _metrics.value.filterKeys { key -> retained.any { it.id == key } }
+    }
     fun task(id: String) = _tasks.value.firstOrNull { it.id == id }
     private fun commitTasks(value: List<TransferTask>) {
         val bytes = JSONArray(value.map { it.json() }).toString().toByteArray(Charsets.UTF_8)
         val out = queueFile.startWrite()
         try { out.write(bytes); queueFile.finishWrite(out) } catch (error: Exception) { queueFile.failWrite(out); throw error }
+        lastJournalTime = elapsedMillis()
+        journalOffsets = value.associate { it.id to it.offset }
         _tasks.value = value
     }
 

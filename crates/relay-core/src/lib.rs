@@ -19,7 +19,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, MutexGuard, Weak,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::broadcast;
@@ -30,6 +33,28 @@ const CLAIM_LIFETIME: i64 = 10 * 60 * 1000;
 const SESSION_LIFETIME: i64 = 90 * 24 * 60 * 60 * 1000;
 const MAX_TEXT: usize = 100 * 1024;
 
+/// Authentication result scoped to a single request, never a session cache.
+/// Reading a slow request body must not extend the credential's expiry.
+#[derive(Clone)]
+pub struct AuthenticatedSession {
+    actor: String,
+    expires_at: i64,
+}
+
+impl AuthenticatedSession {
+    /// Core operations separately check that this device has not been revoked.
+    pub fn actor(&self) -> Result<&str> {
+        if self.expires_at <= now_ms() {
+            return Err(RelayError::new(
+                401,
+                "UNAUTHENTICATED",
+                "连接已失效，请重新配对",
+            ));
+        }
+        Ok(&self.actor)
+    }
+}
+
 pub struct Relay {
     config: Config,
     server_id: String,
@@ -38,6 +63,7 @@ pub struct Relay {
     _workspace_lock: File,
     upload_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     events: broadcast::Sender<()>,
+    authorization_generation: AtomicU64,
 }
 
 impl Relay {
@@ -117,6 +143,7 @@ impl Relay {
             _workspace_lock: lock,
             upload_locks: Mutex::new(HashMap::new()),
             events,
+            authorization_generation: AtomicU64::new(0),
         };
         relay.recover()?;
         Ok(relay)
@@ -157,6 +184,11 @@ impl Relay {
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.events.subscribe()
     }
+    /// Changes only when authorization is revoked. File progress must not force
+    /// unrelated download streams to perform a database lookup for every chunk.
+    pub fn authorization_generation(&self) -> u64 {
+        self.authorization_generation.load(Ordering::Acquire)
+    }
     fn changed(&self) {
         let _ = self.events.send(());
     }
@@ -181,6 +213,10 @@ impl Relay {
     }
 
     pub fn authenticate(&self, token: &str) -> Result<String> {
+        Ok(self.authenticate_session(token)?.actor()?.to_owned())
+    }
+
+    pub fn authenticate_session(&self, token: &str) -> Result<AuthenticatedSession> {
         if token.len() != 43 {
             return Err(RelayError::new(
                 401,
@@ -189,14 +225,14 @@ impl Relay {
             ));
         }
         let db = self.db()?;
-        let actor: Option<String> = db.query_row("SELECT s.device_id FROM sessions s JOIN devices d ON d.id=s.device_id WHERE s.token_hash=? AND s.expires_at>? AND d.revoked=0", params![digest(token.as_bytes()), now_ms()], |r| r.get(0)).optional()?;
-        let actor = actor
+        let authenticated: Option<(String, i64)> = db.query_row("SELECT s.device_id,s.expires_at FROM sessions s JOIN devices d ON d.id=s.device_id WHERE s.token_hash=? AND s.expires_at>? AND d.revoked=0", params![digest(token.as_bytes()), now_ms()], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (actor, expires_at) = authenticated
             .ok_or_else(|| RelayError::new(401, "UNAUTHENTICATED", "连接已失效，请重新配对"))?;
         db.execute(
             "UPDATE devices SET last_seen=? WHERE id=? AND last_seen<?",
             params![now_ms(), actor, now_ms() - 60_000],
         )?;
-        Ok(actor)
+        Ok(AuthenticatedSession { actor, expires_at })
     }
 
     pub fn create_invite(&self) -> Result<Invite> {
@@ -372,6 +408,8 @@ impl Relay {
         }
         tx.execute("DELETE FROM sessions WHERE device_id=?", [id])?;
         tx.commit()?;
+        self.authorization_generation
+            .fetch_add(1, Ordering::Release);
         self.changed();
         Ok(())
     }
@@ -526,7 +564,33 @@ impl Relay {
                 .as_deref()
                 .ok_or_else(|| bad("INVALID_BUILD", "反馈缺少构建引用"))?,
         )?;
-        let mut out=format!("# 随手传 · 构建反馈\n\n- 项目：{}\n- 构建文件：{}\n- 构建 ID：{}\n- SHA-256：{}\n- 测试状态（人工确认）：{}\n- 反馈 ID：{}\n- 反馈时间（Unix ms）：{}\n\n## 问题描述\n\n{}\n\n## 附件\n\n",markdown(&build.project),markdown(&build.name),build.id,build.sha256,build.test_status,feedback.id,feedback.created_at,quoted(&feedback.text));
+        let apk = build.apk.as_ref();
+        let known = |value: Option<&str>| {
+            value
+                .filter(|s| !s.trim().is_empty())
+                .map(markdown)
+                .unwrap_or_else(|| "未知（未解析）".into())
+        };
+        let mut out = format!(
+            "# 随手传 · 构建反馈\n\n\
+            - 项目：{}\n- 构建文件：{}\n- 构建 ID：{}\n- SHA-256：{}\n\
+            - APK 包名（package_name）：{}\n- APK 版本名称（version_name）：{}\n\
+            - APK 版本号（version_code）：{}\n- APK 元数据解析状态：{}\n\
+            - 测试状态（人工确认）：{}\n- 反馈 ID：{}\n- 反馈时间（Unix ms）：{}\n\n\
+            ## 问题描述\n\n{}\n\n## 附件\n\n",
+            markdown(&build.project),
+            markdown(&build.name),
+            build.id,
+            build.sha256,
+            known(apk.and_then(|m| m.package_name.as_deref())),
+            known(apk.and_then(|m| m.version_name.as_deref())),
+            known(apk.and_then(|m| m.version_code.as_deref())),
+            known(apk.map(|m| m.status.as_str())),
+            build.test_status,
+            feedback.id,
+            feedback.created_at,
+            quoted(&feedback.text),
+        );
         for attachment in feedback.attachment_ids {
             let item = get_item(&db, &attachment)?;
             out.push_str(&format!(
@@ -710,7 +774,8 @@ impl Relay {
             .read(true)
             .write(true)
             .open(self.temp_path(id))?;
-        if file.metadata()?.len() < offset {
+        let stored_length = file.metadata()?.len();
+        if stored_length < offset {
             upload.status = "failed".into();
             save_upload(&db, &upload)?;
             return Err(RelayError::new(
@@ -719,7 +784,11 @@ impl Relay {
                 "已确认的文件内容缺失，请重新开始",
             ));
         }
-        file.set_len(offset)?;
+        // Only truncate an unacknowledged tail; resizing an already correct file
+        // needlessly dirties its metadata on every durable append.
+        if stored_length > offset {
+            file.set_len(offset)?;
+        }
         file.seek(SeekFrom::Start(offset))?;
         let result = (|| -> Result<()> {
             file.write_all(bytes)?;
