@@ -36,3 +36,10 @@ target/
 *.sqlite-wal
 *.sqlite-shm
 *.part
+
+# Local benchmark evidence and runtime workspace credentials
+/docs/benchmarks/
+**/server-key
+**/workspace.lock
+*.db
+*.db-*
