@@ -38,8 +38,12 @@ target/
 *.part
 
 # Local benchmark evidence and runtime workspace credentials
-/docs/benchmarks/
+/docs/
 **/server-key
 **/workspace.lock
 *.db
 *.db-*
+
+# Local agent instructions are not published
+[Aa][Gg][Ee][Nn][Tt].md
+[Aa][Gg][Ee][Nn][Tt][Ss].md

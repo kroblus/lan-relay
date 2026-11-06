@@ -111,7 +111,7 @@ def build_delivery(windows: Path, android: Path, output: Path,
         '两端打开应用后从「设备」发现同一局域网设备，首次核对后批准。'
         '普通收发无需填写开发验收记录；安装 APK 仍由系统要求本人确认。\n\n'
         '自动构建和单测通过不代表 Windows 原生界面、Android 真机或真实 Wi-Fi 已通过。'
-        '验收任务见源码 docs/CODEX_ACCEPTANCE.md。\n', encoding='utf-8')
+        '请分别记录 Windows 与 Android 真机测试结果；编译通过不代表真机验收通过。\n', encoding='utf-8')
     hashes = []
     for path in sorted(output.rglob('*')):
         if path.is_file():
